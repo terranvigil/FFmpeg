@@ -1,3 +1,8 @@
+> **This is a fork.** It carries one addition to upstream FFmpeg: a
+> `libavcodec` encoder wrapper for [next264](https://github.com/terranvigil/next264).
+> It is a staging ground for an ffmpeg-devel submission, not a parallel FFmpeg.
+> See [README.next264.md](README.next264.md). For FFmpeg itself, use upstream.
+
 FFmpeg README
 =============
 
