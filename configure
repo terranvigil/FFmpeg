@@ -302,6 +302,7 @@ External library support:
   --enable-libvvenc        enable H.266/VVC encoding via vvenc [no]
   --enable-libwebp         enable WebP encoding via libwebp [no]
   --enable-libx264         enable H.264 encoding via x264 [no]
+  --enable-libnext264      enable H.264 encoding via next264 [no]
   --enable-libx265         enable HEVC encoding via x265 [no]
   --enable-libxeve         enable EVC encoding via libxeve [no]
   --enable-libxeveb        enable EVC encoding via libxeve (Base profile) [no]
@@ -2063,6 +2064,7 @@ EXTERNAL_LIBRARY_LIST="
     libmodplug
     libmp3lame
     libmysofa
+    libnext264
     liboapv
     libopencv
     libopencolorio
@@ -3833,6 +3835,7 @@ libx264_encoder_deps="libx264"
 libx264_encoder_select="atsc_a53 golomb"
 libx264rgb_encoder_deps="libx264"
 libx264rgb_encoder_select="libx264_encoder"
+libnext264_encoder_deps="libnext264"
 libx265_encoder_deps="libx265"
 libx265_encoder_select="atsc_a53 dovi_rpuenc"
 libxavs_encoder_deps="libxavs"
@@ -7423,6 +7426,7 @@ enabled libvvenc          && require_pkg_config libvvenc "libvvenc >= 1.6.1" "vv
 enabled libwebp           && {
     enabled libwebp_encoder      && require_pkg_config libwebp "libwebp >= 0.2.0" webp/encode.h WebPGetEncoderVersion
     enabled libwebp_anim_encoder && check_pkg_config libwebp_anim_encoder "libwebpmux >= 0.4.0" webp/mux.h WebPAnimEncoderOptionsInit; }
+enabled libnext264        && require_pkg_config libnext264 next264 "stdint.h next264.h" next264_encoder_open
 enabled libx264           && require_pkg_config libx264 x264 "stdint.h x264.h" x264_encoder_encode &&
                              require_cpp_condition libx264 x264.h "X264_BUILD >= 155" && {
                              [ "$toolchain" != "msvc" ] ||

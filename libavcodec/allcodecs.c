@@ -837,6 +837,7 @@ extern const FFCodec ff_libwebp_encoder;
 extern const FFCodec ff_libx262_encoder;
 extern const FFCodec ff_libx264_encoder;
 extern const FFCodec ff_libx264rgb_encoder;
+extern FFCodec ff_libnext264_encoder;
 extern FFCodec ff_libx265_encoder;
 extern const FFCodec ff_libxeve_encoder;
 extern const FFCodec ff_libxevd_decoder;
