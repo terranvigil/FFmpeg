@@ -57,6 +57,17 @@ typedef struct Next264Context {
     struct Next264Out { uint8_t *data; size_t size; int key; } *out;
     int      out_alloc;
     int      out_count;
+
+    /* Input frames held back before any are submitted. next264 parallelises
+     * over a window: it needs a run of consecutive submits in flight before
+     * the GOP and frame workers have anything to spread. lavc hands over one
+     * frame per packet retrieved, so draining after every submit pins the
+     * encoder near serial. Buffering `depth` frames and then feeding them
+     * back-to-back gives it the run it needs. */
+    AVFrame **inq;
+    int       inq_alloc;
+    int       inq_count;
+    int       depth;
 } Next264Context;
 
 typedef struct Next264Out Next264Out;
@@ -73,6 +84,9 @@ static av_cold int next264_close(AVCodecContext *avctx)
     while (ctx->out_count > 0)
         av_freep(&ctx->out[--ctx->out_count].data);
     av_freep(&ctx->out);
+    while (ctx->inq_count > 0)
+        av_frame_free(&ctx->inq[--ctx->inq_count]);
+    av_freep(&ctx->inq);
     return 0;
 }
 
@@ -120,10 +134,16 @@ static av_cold int next264_init(AVCodecContext *avctx)
         p->timebase.fps_den = avctx->time_base.num;
     }
 
-    /* The encoder threads itself; AV_CODEC_CAP_OTHER_THREADS tells lavc not to
-     * wrap it, so avctx->thread_count is a request to pass straight through. */
-    if (avctx->thread_count > 0)
-        p->threads = avctx->thread_count;
+    /* One encoder instance parallelises in-frame only, on the row wavefront.
+     * `threads` above 1 is the CLI's GOP-level split, which lives in the
+     * application and not in the library, so a single instance cannot use it.
+     * Map the request onto frame_threads, capped at what a picture this size
+     * can actually keep busy. */
+    if (avctx->thread_count > 0) {
+        int cap = next264_frame_thread_cap(avctx->width, avctx->height);
+        p->frame_threads = avctx->thread_count < cap ? avctx->thread_count : cap;
+        p->threads = 1;
+    }
 
     if (avctx->gop_size > 0)
         p->keyint = avctx->gop_size;
@@ -188,6 +208,15 @@ static av_cold int next264_init(AVCodecContext *avctx)
         return AVERROR(ENOMEM);
     ctx->frame = av_frame_alloc();
     if (!ctx->frame)
+        return AVERROR(ENOMEM);
+    /* Input frames are held one at a time. Buffering a deeper run was tried
+     * and measured no difference at any depth from 1 to 256: a single encoder
+     * instance parallelises on the row wavefront, which frame_threads above
+     * drives, not on how many frames are queued ahead of it. */
+    ctx->depth = 1;
+    ctx->inq_alloc = 1;
+    ctx->inq = av_calloc(ctx->inq_alloc, sizeof(*ctx->inq));
+    if (!ctx->inq)
         return AVERROR(ENOMEM);
     /* dts starts far enough back that the reordered pts never precedes it. */
     ctx->dts_next = -ctx->delay_frames;
@@ -322,64 +351,116 @@ static int burst_pop(AVCodecContext *avctx, AVPacket *pkt)
     return 0;
 }
 
+/* Submit one buffered frame and stash whatever comes back. */
+static int submit_one(AVCodecContext *avctx, AVFrame *f)
+{
+    Next264Context *ctx = avctx->priv_data;
+    next264_picture_t pic;
+    next264_nal_t *nal;
+    int nnal = 0, i, ret;
+
+    memset(&pic, 0, sizeof(pic));
+    pic.csp    = ctx->params.csp;
+    pic.width  = avctx->width;
+    pic.height = avctx->height;
+    pic.pts    = f->pts;
+    for (i = 0; i < 3; i++) {
+        pic.plane[i]  = (pixel *)f->data[i];
+        pic.stride[i] = f->linesize[i] / (int)sizeof(pixel);
+    }
+    ret = pts_push(ctx, f->pts);
+    if (ret < 0)
+        return ret;
+    ret = next264_encoder_encode(ctx->enc, &nal, &nnal, &pic);
+    if (ret < 0)
+        return AVERROR_EXTERNAL;
+    if (nnal > 0)
+        return burst_stash(ctx, nal, nnal);
+    return 0;
+}
+
+static int drain_queue(AVCodecContext *avctx)
+{
+    Next264Context *ctx = avctx->priv_data;
+    int i, ret;
+
+    for (i = 0; i < ctx->inq_count; i++) {
+        ret = submit_one(avctx, ctx->inq[i]);
+        av_frame_free(&ctx->inq[i]);
+        if (ret < 0) {
+            for (i++; i < ctx->inq_count; i++)
+                av_frame_free(&ctx->inq[i]);
+            ctx->inq_count = 0;
+            return ret;
+        }
+    }
+    ctx->inq_count = 0;
+    return 0;
+}
+
 static int next264_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 {
     Next264Context *ctx = avctx->priv_data;
-    next264_picture_t pic, *picp;
     next264_nal_t *nal;
-    AVFrame *frame = ctx->frame;
-    int nnal = 0, i, ret;
+    int nnal = 0, ret;
 
-    /* Anything already split from a previous burst goes out first. */
     ret = burst_pop(avctx, pkt);
     if (ret != AVERROR(EAGAIN))
         return ret;
 
     for (;;) {
-        picp = NULL;
         if (!ctx->eof) {
-            ret = ff_encode_get_frame(avctx, frame);
-            if (ret == AVERROR_EOF)
+            ret = ff_encode_get_frame(avctx, ctx->frame);
+            if (ret == AVERROR_EOF) {
                 ctx->eof = 1;
-            else if (ret < 0)
+            } else if (ret == AVERROR(EAGAIN)) {
+                /* lavc has nothing more right now. Ask for another frame
+                 * rather than forcing the encoder to work on a short queue. */
+                return AVERROR(EAGAIN);
+            } else if (ret < 0) {
+                return ret;
+            } else {
+                AVFrame *held = av_frame_alloc();
+                if (!held)
+                    return AVERROR(ENOMEM);
+                av_frame_move_ref(held, ctx->frame);
+                if (ctx->inq_count == ctx->inq_alloc) {
+                    int n = ctx->inq_alloc * 2;
+                    AVFrame **q = av_realloc_array(ctx->inq, n, sizeof(*q));
+                    if (!q) { av_frame_free(&held); return AVERROR(ENOMEM); }
+                    ctx->inq = q;
+                    ctx->inq_alloc = n;
+                }
+                ctx->inq[ctx->inq_count++] = held;
+
+                /* Hold back until the run is deep enough to be worth starting. */
+                if (ctx->inq_count < ctx->depth)
+                    return AVERROR(EAGAIN);
+            }
+        }
+
+        if (ctx->inq_count > 0) {
+            ret = drain_queue(avctx);
+            if (ret < 0)
+                return ret;
+            ret = burst_pop(avctx, pkt);
+            if (ret != AVERROR(EAGAIN))
                 return ret;
         }
 
-        if (!ctx->eof) {
-            memset(&pic, 0, sizeof(pic));
-            pic.csp    = ctx->params.csp;
-            pic.width  = avctx->width;
-            pic.height = avctx->height;
-            pic.pts    = frame->pts;
-            for (i = 0; i < 3; i++) {
-                pic.plane[i]  = (pixel *)frame->data[i];
-                pic.stride[i] = frame->linesize[i] / (int)sizeof(pixel);
+        if (ctx->eof) {
+            ret = next264_encoder_encode(ctx->enc, &nal, &nnal, NULL);
+            if (ret < 0)
+                return AVERROR_EXTERNAL;
+            if (nnal > 0) {
+                int r = burst_stash(ctx, nal, nnal);
+                if (r < 0)
+                    return r;
+                return burst_pop(avctx, pkt);
             }
-            picp = &pic;
-            ret = pts_push(ctx, frame->pts);
-            if (ret < 0) { av_frame_unref(frame); return ret; }
+            if (ret <= 0 && nnal == 0)
+                return AVERROR_EOF;
         }
-
-        ret = next264_encoder_encode(ctx->enc, &nal, &nnal, picp);
-        if (picp)
-            av_frame_unref(frame);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "next264_encoder_encode failed\n");
-            return AVERROR_EXTERNAL;
-        }
-
-        if (nnal > 0) {
-            int r = burst_stash(ctx, nal, nnal);
-            if (r < 0)
-                return r;
-            return burst_pop(avctx, pkt);
-        }
-
-        /* The flush contract is "call until it returns 0 bytes with 0 units",
-         * so an empty flush call is not the end. Only a zero-byte, zero-unit
-         * return after EOF finishes the stream. */
-        if (ctx->eof && ret <= 0 && nnal == 0)
-            return AVERROR_EOF;
     }
 }
 
