@@ -250,6 +250,7 @@ External library support:
   --enable-liblensfun      enable lensfun lens correction [no]
   --enable-libmodplug      enable ModPlug via libmodplug [no]
   --enable-libmp3lame      enable MP3 encoding via libmp3lame [no]
+  --enable-libnextav1      enable AV1 encoding via nextav1 [no]
   --enable-libopencore-amrnb enable AMR-NB de/encoding via libopencore-amrnb [no]
   --enable-libopencore-amrwb enable AMR-WB decoding via libopencore-amrwb [no]
   --enable-libopencv       enable video filtering via libopencv [no]
@@ -1937,6 +1938,7 @@ EXTERNAL_LIBRARY_LIST="
     libmodplug
     libmp3lame
     libmysofa
+    libnextav1
     libopencv
     libopenh264
     libopenjpeg
@@ -3547,6 +3549,7 @@ liblc3_encoder_select="audio_frame_queue"
 libmodplug_demuxer_deps="libmodplug"
 libmp3lame_encoder_deps="libmp3lame"
 libmp3lame_encoder_select="audio_frame_queue mpegaudioheader"
+libnextav1_encoder_deps="libnextav1"
 libopencore_amrnb_decoder_deps="libopencore_amrnb"
 libopencore_amrnb_encoder_deps="libopencore_amrnb"
 libopencore_amrnb_encoder_select="audio_frame_queue"
@@ -6978,6 +6981,7 @@ enabled libmodplug        && require_pkg_config libmodplug libmodplug libmodplug
 enabled libmp3lame        && require "libmp3lame >= 3.98.3" lame/lame.h lame_set_VBR_quality -lmp3lame $libm_extralibs
 enabled libmysofa         && { check_pkg_config libmysofa libmysofa mysofa.h mysofa_neighborhood_init_withstepdefine ||
                                require libmysofa mysofa.h mysofa_neighborhood_init_withstepdefine -lmysofa $zlib_extralibs; }
+enabled libnextav1        && require_pkg_config libnextav1 nextav1 nextav1.h nextav1_encoder_open
 enabled libnpp            && { check_lib libnpp npp.h nppGetLibVersion -lnppig -lnppicc -lnppc -lnppidei -lnppif ||
                                check_lib libnpp npp.h nppGetLibVersion -lnppi -lnppif -lnppc -lnppidei ||
                                die "ERROR: libnpp not found"; }
