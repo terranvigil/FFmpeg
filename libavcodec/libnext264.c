@@ -152,11 +152,26 @@ static av_cold int next264_init(AVCodecContext *avctx)
         p->threads = 1;
     }
 
+    /* A preset has already put considered values in the param struct, and
+     * AVCodecContext carries defaults of its own for these three. Copying them
+     * over unconditionally lets a default the caller never asked for outrank
+     * the preset: -preset medium selects ref=3, avctx->refs defaults to 1, and
+     * next264 was encoding every ffmpeg job at ref=1. That cost about a point
+     * of VMAF while making the encoder look faster than it is. Take each value
+     * only when the caller actually set it. */
     if (avctx->gop_size > 0)
         p->keyint = avctx->gop_size;
     if (avctx->max_b_frames >= 0)
         p->bframes = avctx->max_b_frames;
-    if (avctx->refs > 0)
+    /* refs, unlike gop_size and max_b_frames, has a POSITIVE default: an
+     * untouched AVCodecContext reports 1, so "is it positive" cannot tell a
+     * caller's choice from libavcodec's default, and the default won. Every
+     * ffmpeg job ran next264 at ref=1 no matter the preset, which cost about a
+     * point of VMAF and made the encoder look faster than it is. Ask the option
+     * machinery whether the value was actually assigned. One consequence is
+     * that an explicit -refs 1 reads as untouched and leaves the preset alone.
+     */
+    if (av_opt_is_set_to_default_by_name(avctx, "refs", 0) == 0 && avctx->refs > 0)
         p->ref = avctx->refs;
 
     /* Rate control. An explicit bitrate selects ABR; otherwise CRF, which is
