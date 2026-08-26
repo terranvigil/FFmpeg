@@ -44,12 +44,16 @@ typedef struct Next264Context {
     float aq_strength;
     float psy_rd;
 
-    /* Frames submitted but not yet emitted. The encoder reorders and buffers,
-     * so a dts has to be reconstructed rather than taken from the frame that
-     * happened to be submitted last. */
-    int64_t *pts_queue;
+    /* Input timestamps kept BY DISPLAY INDEX, because that is the key the
+     * encoder reports its output against. The encoder reorders, so a packet's
+     * timestamp cannot be inferred from arrival order: B frames are coded after
+     * the anchor that follows them in display order, and pairing packets with
+     * timestamps as they arrive gives every B the wrong one. */
+    int64_t *pts_by_disp;
     int      pts_alloc;
-    int      pts_count;
+    int      n_input;           /* display index of the next submitted frame */
+    int     *emit_disp;         /* which frames the last encode call emitted */
+    int      emit_alloc;
     int64_t  dts_next;
     int      delay_frames;
     int      eof;
@@ -61,7 +65,7 @@ typedef struct Next264Context {
      * decode at all. */
     uint8_t *hdr;
     size_t   hdr_size;
-    struct Next264Out { uint8_t *data; size_t size; int key; } *out;
+    struct Next264Out { uint8_t *data; size_t size; int key; int64_t pts; } *out;
     int      out_alloc;
     int      out_count;
 
@@ -86,7 +90,8 @@ static av_cold int next264_close(AVCodecContext *avctx)
     if (ctx->enc)
         next264_encoder_close(ctx->enc);
     ctx->enc = NULL;
-    av_freep(&ctx->pts_queue);
+    av_freep(&ctx->pts_by_disp);
+    av_freep(&ctx->emit_disp);
     av_frame_free(&ctx->frame);
     while (ctx->out_count > 0)
         av_freep(&ctx->out[--ctx->out_count].data);
@@ -230,8 +235,8 @@ static av_cold int next264_init(AVCodecContext *avctx)
     }
 
     ctx->pts_alloc = 64;
-    ctx->pts_queue = av_malloc_array(ctx->pts_alloc, sizeof(*ctx->pts_queue));
-    if (!ctx->pts_queue)
+    ctx->pts_by_disp = av_malloc_array(ctx->pts_alloc, sizeof(*ctx->pts_by_disp));
+    if (!ctx->pts_by_disp)
         return AVERROR(ENOMEM);
     ctx->frame = av_frame_alloc();
     if (!ctx->frame)
@@ -258,38 +263,54 @@ static av_cold int next264_init(AVCodecContext *avctx)
     return 0;
 }
 
-/* Record a submitted pts. Output is in coding order while these arrive in
- * display order, so the sorted queue is what makes a monotonic dts possible. */
+/* Record a submitted frame's timestamp against its display index. */
 static int pts_push(Next264Context *ctx, int64_t pts)
 {
-    int i;
-
-    if (ctx->pts_count == ctx->pts_alloc) {
+    if (ctx->n_input == ctx->pts_alloc) {
         int n = ctx->pts_alloc * 2;
-        int64_t *q = av_realloc_array(ctx->pts_queue, n, sizeof(*q));
+        int64_t *q = av_realloc_array(ctx->pts_by_disp, n, sizeof(*q));
         if (!q)
             return AVERROR(ENOMEM);
-        ctx->pts_queue = q;
+        ctx->pts_by_disp = q;
         ctx->pts_alloc = n;
     }
-    for (i = ctx->pts_count; i > 0 && ctx->pts_queue[i - 1] > pts; i--)
-        ctx->pts_queue[i] = ctx->pts_queue[i - 1];
-    ctx->pts_queue[i] = pts;
-    ctx->pts_count++;
+    ctx->pts_by_disp[ctx->n_input++] = pts;
     return 0;
 }
 
-static int64_t pts_pop_smallest(Next264Context *ctx)
+/* Ask the encoder which frames the call just emitted, in coding order, and
+ * label each stashed packet with that frame's timestamp. This is the step that
+ * was missing: without it the wrapper handed out timestamps in sorted order and
+ * the file's presentation timestamps ran backwards. */
+static int burst_label(Next264Context *ctx, int first, int nframes)
 {
-    int64_t v;
+    int n, i;
 
-    if (ctx->pts_count <= 0)
-        return AV_NOPTS_VALUE;
-    v = ctx->pts_queue[0];
-    memmove(ctx->pts_queue, ctx->pts_queue + 1,
-            (ctx->pts_count - 1) * sizeof(*ctx->pts_queue));
-    ctx->pts_count--;
-    return v;
+    if (nframes <= 0)
+        return 0;
+    if (ctx->emit_alloc < nframes) {
+        int *d = av_realloc_array(ctx->emit_disp, nframes, sizeof(*d));
+        if (!d)
+            return AVERROR(ENOMEM);
+        ctx->emit_disp = d;
+        ctx->emit_alloc = nframes;
+    }
+    /* Take exactly as many as we split. The encoder finalises frames and
+     * appends their NALs on decoupled schedules, so asking per call would
+     * mismatch; asking per packet cannot. */
+    n = next264_encoder_frame_order(ctx->enc, ctx->emit_disp, nframes);
+    if (n != nframes) {
+        av_log(ctx, AV_LOG_ERROR,
+               "split %d packets but the encoder has %d frames to label\n",
+               nframes, n);
+        return AVERROR_EXTERNAL;
+    }
+    for (i = 0; i < nframes; i++) {
+        int d = ctx->emit_disp[i];
+        ctx->out[first + i].pts = (d >= 0 && d < ctx->n_input)
+                                ? ctx->pts_by_disp[d] : AV_NOPTS_VALUE;
+    }
+    return 0;
 }
 
 /* The encoder returns NAL units in coding order and a single call can carry
@@ -374,7 +395,7 @@ static int burst_pop(AVCodecContext *avctx, AVPacket *pkt)
      * the queued pts are in display order. The earliest outstanding pts is
      * this packet's presentation time; dts trails it by the reorder depth so
      * dts <= pts holds for every packet. */
-    pkt->pts = pts_pop_smallest(ctx);
+    pkt->pts = o->pts;
     pkt->dts = ctx->dts_next++;
     if (pkt->pts == AV_NOPTS_VALUE)
         pkt->dts = AV_NOPTS_VALUE;
@@ -409,7 +430,12 @@ static int submit_one(AVCodecContext *avctx, AVFrame *f)
     if (ret < 0)
         return AVERROR_EXTERNAL;
     if (nnal > 0)
-        return burst_stash(ctx, nal, nnal);
+        {
+            int first = ctx->out_count, r = burst_stash(ctx, nal, nnal);
+            if (r < 0)
+                return r;
+            return burst_label(ctx, first, ctx->out_count - first);
+        }
     return 0;
 }
 
@@ -487,7 +513,10 @@ static int next264_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
             if (ret < 0)
                 return AVERROR_EXTERNAL;
             if (nnal > 0) {
+                int first = ctx->out_count;
                 int r = burst_stash(ctx, nal, nnal);
+                if (r >= 0)
+                    r = burst_label(ctx, first, ctx->out_count - first);
                 if (r < 0)
                     return r;
                 return burst_pop(avctx, pkt);
