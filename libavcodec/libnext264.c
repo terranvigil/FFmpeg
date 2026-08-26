@@ -54,6 +54,12 @@ typedef struct Next264Context {
     int      eof;
 
     AVFrame *frame;
+    /* SPS/PPS held for in-band emission. A muxer that wants a global header
+     * takes them through extradata; one that does not, such as raw Annex-B,
+     * needs them in the stream ahead of the first slice or the result does not
+     * decode at all. */
+    uint8_t *hdr;
+    size_t   hdr_size;
     struct Next264Out { uint8_t *data; size_t size; int key; } *out;
     int      out_alloc;
     int      out_count;
@@ -84,6 +90,7 @@ static av_cold int next264_close(AVCodecContext *avctx)
     while (ctx->out_count > 0)
         av_freep(&ctx->out[--ctx->out_count].data);
     av_freep(&ctx->out);
+    av_freep(&ctx->hdr);
     while (ctx->inq_count > 0)
         av_frame_free(&ctx->inq[--ctx->inq_count]);
     av_freep(&ctx->inq);
@@ -186,11 +193,12 @@ static av_cold int next264_init(AVCodecContext *avctx)
      * first dts values are placed early enough that dts <= pts always holds. */
     ctx->delay_frames = next264_lookahead_delay(p) + p->bframes;
 
+    if (next264_encoder_headers(ctx->enc, &nal, &nnal) < 0)
+        return AVERROR_EXTERNAL;
+    for (i = 0; i < nnal; i++)
+        size += nal[i].size;
+
     if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
-        if (next264_encoder_headers(ctx->enc, &nal, &nnal) < 0)
-            return AVERROR_EXTERNAL;
-        for (i = 0; i < nnal; i++)
-            size += nal[i].size;
         avctx->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!avctx->extradata)
             return AVERROR(ENOMEM);
@@ -200,6 +208,16 @@ static av_cold int next264_init(AVCodecContext *avctx)
             dst += nal[i].size;
         }
         avctx->extradata_size = size;
+    } else {
+        ctx->hdr = av_malloc(size);
+        if (!ctx->hdr)
+            return AVERROR(ENOMEM);
+        dst = ctx->hdr;
+        for (i = 0; i < nnal; i++) {
+            memcpy(dst, nal[i].payload, nal[i].size);
+            dst += nal[i].size;
+        }
+        ctx->hdr_size = size;
     }
 
     ctx->pts_alloc = 64;
@@ -329,10 +347,17 @@ static int burst_pop(AVCodecContext *avctx, AVPacket *pkt)
         return AVERROR(EAGAIN);
 
     o = &ctx->out[0];
-    ret = ff_get_encode_buffer(avctx, pkt, o->size, 0);
+    ret = ff_get_encode_buffer(avctx, pkt, o->size + ctx->hdr_size, 0);
     if (ret < 0)
         return ret;
-    memcpy(pkt->data, o->data, o->size);
+    if (ctx->hdr_size) {
+        memcpy(pkt->data, ctx->hdr, ctx->hdr_size);
+        memcpy(pkt->data + ctx->hdr_size, o->data, o->size);
+        av_freep(&ctx->hdr);
+        ctx->hdr_size = 0;
+    } else {
+        memcpy(pkt->data, o->data, o->size);
+    }
     if (o->key)
         pkt->flags |= AV_PKT_FLAG_KEY;
 
