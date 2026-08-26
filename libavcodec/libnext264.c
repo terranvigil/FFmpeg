@@ -166,6 +166,15 @@ static av_cold int next264_init(AVCodecContext *avctx)
     if (avctx->rc_buffer_size > 0)
         p->rc.vbv_bufsize = (int)(avctx->rc_buffer_size / 1000);
 
+    /* next264_param_default() is not the encoder's shipped configuration: the
+     * CLI resolves a few values on top of it, and a library caller that skips
+     * that resolution gets a different encoder. AQ is the one that matters --
+     * the default struct leaves it off, while every shipped non-CQP encode runs
+     * it at 0.4. Left off, this wrapper emitted 32% more bits than the CLI at
+     * the same CRF. Mirror the CLI's rule until the library adopts it. */
+    if (ctx->aq_strength < 0)
+        p->aq_strength = (p->rc.method != NEXT264_RC_CQP) ? 0.4f : 0.0f;
+
     if (ctx->subme >= 0)       p->subme       = ctx->subme;
     if (ctx->trellis_opt >= 0) p->trellis     = ctx->trellis_opt;
     if (ctx->aq_strength >= 0) p->aq_strength = ctx->aq_strength;
