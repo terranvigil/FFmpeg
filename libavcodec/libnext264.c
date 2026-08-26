@@ -20,6 +20,7 @@
 
 #include <next264.h>
 
+#include "libavutil/cpu.h"
 #include "libavutil/opt.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
@@ -146,9 +147,21 @@ static av_cold int next264_init(AVCodecContext *avctx)
      * application and not in the library, so a single instance cannot use it.
      * Map the request onto frame_threads, capped at what a picture this size
      * can actually keep busy. */
-    if (avctx->thread_count > 0) {
-        int cap = next264_frame_thread_cap(avctx->width, avctx->height);
-        p->frame_threads = avctx->thread_count < cap ? avctx->thread_count : cap;
+    /* thread_count 0 is ffmpeg's way of saying "decide for me", and it is the
+     * value every ordinary command line arrives with -- nobody types -threads.
+     * Treating only the positive case meant the encoder was left at its own
+     * default and ran on ONE core for every such job: 1080p BBB took 7.8s
+     * against 1.2s once threading was configured, and the 1.05 cores it
+     * occupied never looked like an error, just a slow encoder.
+     *
+     * So resolve auto the way the rest of libavcodec does, through
+     * av_cpu_count(), then clamp to what this frame size can actually feed. */
+    {
+        int want = avctx->thread_count > 0 ? avctx->thread_count : av_cpu_count();
+        int cap  = next264_frame_thread_cap(avctx->width, avctx->height);
+        if (want < 1)
+            want = 1;
+        p->frame_threads = want < cap ? want : cap;
         p->threads = 1;
     }
 
