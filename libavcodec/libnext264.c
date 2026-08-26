@@ -142,36 +142,17 @@ static av_cold int next264_init(AVCodecContext *avctx)
         p->timebase.fps_den = avctx->time_base.num;
     }
 
-    /* One encoder instance parallelises in-frame only, on the row wavefront.
-     * `threads` above 1 is the CLI's GOP-level split, which lives in the
-     * application and not in the library, so a single instance cannot use it.
-     * Map the request onto frame_threads, capped at what a picture this size
-     * can actually keep busy. */
-    /* thread_count 0 is ffmpeg's way of saying "decide for me", and it is the
-     * value every ordinary command line arrives with -- nobody types -threads.
-     * Treating only the positive case meant the encoder was left at its own
-     * default and ran on ONE core for every such job: 1080p BBB took 7.8s
-     * against 1.2s once threading was configured, and the 1.05 cores it
-     * occupied never looked like an error, just a slow encoder.
+    /* The library takes a thread BUDGET and resolves it: 0 means "decide",
+     * which is exactly what ffmpeg's thread_count 0 means, so it passes
+     * straight through. No core counting and no clamping here -- both are the
+     * encoder's business, and a wrapper carrying either would be carrying
+     * encoder policy that upstream would rightly object to.
      *
-     * So resolve auto the way the rest of libavcodec does, through
-     * av_cpu_count(), then clamp to what this frame size can actually feed. */
-    {
-        int want = avctx->thread_count > 0 ? avctx->thread_count : av_cpu_count();
-        int cap  = next264_frame_thread_cap(avctx->width, avctx->height);
-        if (want < 1)
-            want = 1;
-        p->frame_threads = want < cap ? want : cap;
-        p->threads = 1;
-    }
+     * This replaces a version that resolved auto itself via av_cpu_count(), and
+     * before that one that ignored auto entirely and ran every ordinary command
+     * line on a single core. */
+    p->threads = avctx->thread_count;
 
-    /* A preset has already put considered values in the param struct, and
-     * AVCodecContext carries defaults of its own for these three. Copying them
-     * over unconditionally lets a default the caller never asked for outrank
-     * the preset: -preset medium selects ref=3, avctx->refs defaults to 1, and
-     * next264 was encoding every ffmpeg job at ref=1. That cost about a point
-     * of VMAF while making the encoder look faster than it is. Take each value
-     * only when the caller actually set it. */
     if (avctx->gop_size > 0)
         p->keyint = avctx->gop_size;
     if (avctx->max_b_frames >= 0)
@@ -257,8 +238,8 @@ static av_cold int next264_init(AVCodecContext *avctx)
         return AVERROR(ENOMEM);
     /* Input frames are held one at a time. Buffering a deeper run was tried
      * and measured no difference at any depth from 1 to 256: a single encoder
-     * instance parallelises on the row wavefront, which frame_threads above
-     * drives, not on how many frames are queued ahead of it. */
+     * instance parallelises on the row wavefront, which the thread budget
+     * above drives, not on how many frames are queued ahead of it. */
     ctx->depth = 1;
     ctx->inq_alloc = 1;
     ctx->inq = av_calloc(ctx->inq_alloc, sizeof(*ctx->inq));
