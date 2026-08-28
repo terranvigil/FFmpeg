@@ -302,7 +302,6 @@ External library support:
   --enable-libvvenc        enable H.266/VVC encoding via vvenc [no]
   --enable-libwebp         enable WebP encoding via libwebp [no]
   --enable-libx264         enable H.264 encoding via x264 [no]
-  --enable-libnext264      enable H.264 encoding via next264 [no]
   --enable-libx265         enable HEVC encoding via x265 [no]
   --enable-libxeve         enable EVC encoding via libxeve [no]
   --enable-libxeveb        enable EVC encoding via libxeve (Base profile) [no]
@@ -318,6 +317,7 @@ External library support:
                            native MPEG-4/Xvid encoder exists [no]
   --enable-libxml2         enable XML parsing using the C library libxml2, needed
                            for dash and imf demuxing support [no]
+  --enable-libyah264       enable H.264 encoding via yah264 [no]
   --enable-libzimg         enable z.lib, needed for zscale filter [no]
   --enable-libzmq          enable message passing via libzmq [no]
   --enable-libzvbi         enable teletext support via libzvbi [no]
@@ -2064,7 +2064,6 @@ EXTERNAL_LIBRARY_LIST="
     libmodplug
     libmp3lame
     libmysofa
-    libnext264
     liboapv
     libopencv
     libopencolorio
@@ -2110,6 +2109,7 @@ EXTERNAL_LIBRARY_LIST="
     libxeve
     libxeveb
     libxml2
+    libyah264
     libzimg
     libzmq
     libzvbi
@@ -3835,7 +3835,6 @@ libx264_encoder_deps="libx264"
 libx264_encoder_select="atsc_a53 golomb"
 libx264rgb_encoder_deps="libx264"
 libx264rgb_encoder_select="libx264_encoder"
-libnext264_encoder_deps="libnext264"
 libx265_encoder_deps="libx265"
 libx265_encoder_select="atsc_a53 dovi_rpuenc"
 libxavs_encoder_deps="libxavs"
@@ -3843,6 +3842,7 @@ libxavs2_encoder_deps="libxavs2"
 libxevd_decoder_deps_any="libxevd libxevdb"
 libxeve_encoder_deps_any="libxeve libxeveb"
 libxvid_encoder_deps="libxvid"
+libyah264_encoder_deps="libyah264"
 libzvbi_teletext_decoder_deps="libzvbi"
 vapoursynth_demuxer_deps="vapoursynth"
 videotoolbox_suggest="coreservices"
@@ -7426,7 +7426,6 @@ enabled libvvenc          && require_pkg_config libvvenc "libvvenc >= 1.6.1" "vv
 enabled libwebp           && {
     enabled libwebp_encoder      && require_pkg_config libwebp "libwebp >= 0.2.0" webp/encode.h WebPGetEncoderVersion
     enabled libwebp_anim_encoder && check_pkg_config libwebp_anim_encoder "libwebpmux >= 0.4.0" webp/mux.h WebPAnimEncoderOptionsInit; }
-enabled libnext264        && require_pkg_config libnext264 next264 "stdint.h next264.h" next264_encoder_open
 enabled libx264           && require_pkg_config libx264 x264 "stdint.h x264.h" x264_encoder_encode &&
                              require_cpp_condition libx264 x264.h "X264_BUILD >= 155" && {
                              [ "$toolchain" != "msvc" ] ||
@@ -7442,6 +7441,7 @@ enabled libxevdb          && require_pkg_config libxevdb "xevdb >= 0.4.1" "xevd.
 enabled libxeve           && require_pkg_config libxeve "xeve >= 0.5.1" "xeve.h" xeve_encode
 enabled libxeveb          && require_pkg_config libxeveb "xeveb >= 0.5.1" "xeve.h" xeve_encode
 enabled libxvid           && require libxvid xvid.h xvid_global -lxvidcore
+enabled libyah264         && require_pkg_config libyah264 yah264 "stdint.h yah264.h" yah264_encoder_open
 enabled libzimg           && require_pkg_config libzimg "zimg >= 2.7.0" zimg.h zimg_get_api_version
 enabled libzmq            && require_pkg_config libzmq "libzmq >= 4.2.1" zmq.h zmq_ctx_new
 enabled libzvbi           && require_pkg_config libzvbi zvbi-0.2 libzvbi.h vbi_decoder_new &&

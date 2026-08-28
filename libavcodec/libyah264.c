@@ -1,5 +1,5 @@
 /*
- * next264 H.264 encoder wrapper
+ * yah264 H.264 encoder wrapper
  *
  * This file is part of FFmpeg.
  *
@@ -18,7 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <next264.h>
+#include <yah264.h>
 
 #include "libavutil/cpu.h"
 #include "libavutil/opt.h"
@@ -29,12 +29,12 @@
 #include "encode.h"
 #include "internal.h"
 
-typedef struct Next264Context {
+typedef struct Yah264Context {
     AVClass        *class;
-    next264_param_t params;
-    next264_encoder_t *enc;
+    yah264_param_t params;
+    yah264_encoder_t *enc;
 
-    /* next264 hands back NAL units it owns, valid only until the next call in.
+    /* yah264 hands back NAL units it owns, valid only until the next call in.
      * They are copied into the packet before returning. */
     char *preset;
     char *tune;
@@ -65,11 +65,11 @@ typedef struct Next264Context {
      * decode at all. */
     uint8_t *hdr;
     size_t   hdr_size;
-    struct Next264Out { uint8_t *data; size_t size; int key; int64_t pts; } *out;
+    struct Yah264Out { uint8_t *data; size_t size; int key; int64_t pts; } *out;
     int      out_alloc;
     int      out_count;
 
-    /* Input frames held back before any are submitted. next264 parallelises
+    /* Input frames held back before any are submitted. yah264 parallelises
      * over a window: it needs a run of consecutive submits in flight before
      * the GOP and frame workers have anything to spread. lavc hands over one
      * frame per packet retrieved, so draining after every submit pins the
@@ -79,16 +79,16 @@ typedef struct Next264Context {
     int       inq_alloc;
     int       inq_count;
     int       depth;
-} Next264Context;
+} Yah264Context;
 
-typedef struct Next264Out Next264Out;
+typedef struct Yah264Out Yah264Out;
 
-static av_cold int next264_close(AVCodecContext *avctx)
+static av_cold int yah264_close(AVCodecContext *avctx)
 {
-    Next264Context *ctx = avctx->priv_data;
+    Yah264Context *ctx = avctx->priv_data;
 
     if (ctx->enc)
-        next264_encoder_close(ctx->enc);
+        yah264_encoder_close(ctx->enc);
     ctx->enc = NULL;
     av_freep(&ctx->pts_by_disp);
     av_freep(&ctx->emit_disp);
@@ -103,34 +103,34 @@ static av_cold int next264_close(AVCodecContext *avctx)
     return 0;
 }
 
-static int next264_csp_from_pixfmt(enum AVPixelFormat fmt)
+static int yah264_csp_from_pixfmt(enum AVPixelFormat fmt)
 {
     switch (fmt) {
-    case AV_PIX_FMT_YUV420P: return NEXT264_CSP_I420;
-    case AV_PIX_FMT_YUV422P: return NEXT264_CSP_I422;
-    case AV_PIX_FMT_YUV444P: return NEXT264_CSP_I444;
+    case AV_PIX_FMT_YUV420P: return YAH264_CSP_I420;
+    case AV_PIX_FMT_YUV422P: return YAH264_CSP_I422;
+    case AV_PIX_FMT_YUV444P: return YAH264_CSP_I444;
     default:                 return -1;
     }
 }
 
-static av_cold int next264_init(AVCodecContext *avctx)
+static av_cold int yah264_init(AVCodecContext *avctx)
 {
-    Next264Context *ctx = avctx->priv_data;
-    next264_param_t *p = &ctx->params;
-    next264_nal_t *nal;
+    Yah264Context *ctx = avctx->priv_data;
+    yah264_param_t *p = &ctx->params;
+    yah264_nal_t *nal;
     int nnal, csp, i, size = 0;
     uint8_t *dst;
 
-    csp = next264_csp_from_pixfmt(avctx->pix_fmt);
+    csp = yah264_csp_from_pixfmt(avctx->pix_fmt);
     if (csp < 0) {
         av_log(avctx, AV_LOG_ERROR, "unsupported pixel format %s\n",
                av_get_pix_fmt_name(avctx->pix_fmt));
         return AVERROR(EINVAL);
     }
 
-    next264_param_default(p);
+    yah264_param_default(p);
 
-    if (ctx->preset && next264_param_apply_preset(p, ctx->preset) < 0) {
+    if (ctx->preset && yah264_param_apply_preset(p, ctx->preset) < 0) {
         av_log(avctx, AV_LOG_ERROR, "unknown preset '%s'\n", ctx->preset);
         return AVERROR(EINVAL);
     }
@@ -165,7 +165,7 @@ static av_cold int next264_init(AVCodecContext *avctx)
     /* refs, unlike gop_size and max_b_frames, has a POSITIVE default: an
      * untouched AVCodecContext reports 1, so "is it positive" cannot tell a
      * caller's choice from libavcodec's default, and the default won. Every
-     * ffmpeg job ran next264 at ref=1 no matter the preset, which cost about a
+     * ffmpeg job ran yah264 at ref=1 no matter the preset, which cost about a
      * point of VMAF and made the encoder look faster than it is. Ask the option
      * machinery whether the value was actually assigned. One consequence is
      * that an explicit -refs 1 reads as untouched and leaves the preset alone.
@@ -176,10 +176,10 @@ static av_cold int next264_init(AVCodecContext *avctx)
     /* Rate control. An explicit bitrate selects ABR; otherwise CRF, which is
      * what -crf sets and what the encoder defaults to. */
     if (avctx->bit_rate > 0) {
-        p->rc.method  = NEXT264_RC_ABR;
+        p->rc.method  = YAH264_RC_ABR;
         p->rc.bitrate = (int)(avctx->bit_rate / 1000);
     } else {
-        p->rc.method = NEXT264_RC_CRF;
+        p->rc.method = YAH264_RC_CRF;
         p->rc.rf     = ctx->crf;
     }
     if (avctx->rc_max_rate > 0)
@@ -197,17 +197,17 @@ static av_cold int next264_init(AVCodecContext *avctx)
         p->sar_den = avctx->sample_aspect_ratio.den;
     }
 
-    ctx->enc = next264_encoder_open(p);
+    ctx->enc = yah264_encoder_open(p);
     if (!ctx->enc) {
-        av_log(avctx, AV_LOG_ERROR, "next264_encoder_open failed\n");
+        av_log(avctx, AV_LOG_ERROR, "yah264_encoder_open failed\n");
         return AVERROR_EXTERNAL;
     }
 
     /* Input latency the encoder adds beyond B-frame reordering. Needed so the
      * first dts values are placed early enough that dts <= pts always holds. */
-    ctx->delay_frames = next264_lookahead_delay(p) + p->bframes;
+    ctx->delay_frames = yah264_lookahead_delay(p) + p->bframes;
 
-    if (next264_encoder_headers(ctx->enc, &nal, &nnal) < 0)
+    if (yah264_encoder_headers(ctx->enc, &nal, &nnal) < 0)
         return AVERROR_EXTERNAL;
     for (i = 0; i < nnal; i++)
         size += nal[i].size;
@@ -254,9 +254,9 @@ static av_cold int next264_init(AVCodecContext *avctx)
     ctx->dts_next = -ctx->delay_frames;
 
     av_log(avctx, AV_LOG_INFO,
-           "next264 %s cpu=%s preset=%s threads=%d subme=%d bframes=%d ref=%d "
+           "yah264 %s cpu=%s preset=%s threads=%d subme=%d bframes=%d ref=%d "
            "rc=%d crf=%.1f keyint=%d\n",
-           next264_version(), next264_cpu_features(),
+           yah264_version(), yah264_cpu_features(),
            ctx->preset ? ctx->preset : "(none)",
            p->threads, p->subme, p->bframes, p->ref,
            p->rc.method, p->rc.rf, p->keyint);
@@ -264,7 +264,7 @@ static av_cold int next264_init(AVCodecContext *avctx)
 }
 
 /* Record a submitted frame's timestamp against its display index. */
-static int pts_push(Next264Context *ctx, int64_t pts)
+static int pts_push(Yah264Context *ctx, int64_t pts)
 {
     if (ctx->n_input == ctx->pts_alloc) {
         int n = ctx->pts_alloc * 2;
@@ -282,7 +282,7 @@ static int pts_push(Next264Context *ctx, int64_t pts)
  * label each stashed packet with that frame's timestamp. This is the step that
  * was missing: without it the wrapper handed out timestamps in sorted order and
  * the file's presentation timestamps ran backwards. */
-static int burst_label(Next264Context *ctx, int first, int nframes)
+static int burst_label(Yah264Context *ctx, int first, int nframes)
 {
     int n, i;
 
@@ -298,7 +298,7 @@ static int burst_label(Next264Context *ctx, int first, int nframes)
     /* Take exactly as many as we split. The encoder finalises frames and
      * appends their NALs on decoupled schedules, so asking per call would
      * mismatch; asking per packet cannot. */
-    n = next264_encoder_frame_order(ctx->enc, ctx->emit_disp, nframes);
+    n = yah264_encoder_frame_order(ctx->enc, ctx->emit_disp, nframes);
     if (n != nframes) {
         av_log(ctx, AV_LOG_ERROR,
                "split %d packets but the encoder has %d frames to label\n",
@@ -319,13 +319,13 @@ static int burst_label(Next264Context *ctx, int first, int nframes)
  * any parameter-set or SEI units attached to the slice they precede.
  *
  * Each split frame is stashed here and handed out one call at a time. */
-static int burst_stash(Next264Context *ctx, next264_nal_t *nal, int nnal)
+static int burst_stash(Yah264Context *ctx, yah264_nal_t *nal, int nnal)
 {
     int i, start = 0;
 
     for (i = 0; i < nnal; i++) {
-        int is_slice = nal[i].type == NEXT264_NAL_SLICE ||
-                       nal[i].type == NEXT264_NAL_SLICE_IDR;
+        int is_slice = nal[i].type == YAH264_NAL_SLICE ||
+                       nal[i].type == YAH264_NAL_SLICE_IDR;
         if (!is_slice)
             continue;
 
@@ -337,7 +337,7 @@ static int burst_stash(Next264Context *ctx, next264_nal_t *nal, int nnal)
             uint8_t *buf;
             for (j = start; j <= i; j++) {
                 size += nal[j].size;
-                if (nal[j].type == NEXT264_NAL_SLICE_IDR)
+                if (nal[j].type == YAH264_NAL_SLICE_IDR)
                     key = 1;
             }
             buf = av_malloc(size);
@@ -352,7 +352,7 @@ static int burst_stash(Next264Context *ctx, next264_nal_t *nal, int nnal)
             }
             if (ctx->out_count == ctx->out_alloc) {
                 int n = ctx->out_alloc ? ctx->out_alloc * 2 : 16;
-                Next264Out *o = av_realloc_array(ctx->out, n, sizeof(*o));
+                Yah264Out *o = av_realloc_array(ctx->out, n, sizeof(*o));
                 if (!o) { av_free(buf); return AVERROR(ENOMEM); }
                 ctx->out = o;
                 ctx->out_alloc = n;
@@ -369,8 +369,8 @@ static int burst_stash(Next264Context *ctx, next264_nal_t *nal, int nnal)
 
 static int burst_pop(AVCodecContext *avctx, AVPacket *pkt)
 {
-    Next264Context *ctx = avctx->priv_data;
-    Next264Out *o;
+    Yah264Context *ctx = avctx->priv_data;
+    Yah264Out *o;
     int ret;
 
     if (ctx->out_count <= 0)
@@ -409,9 +409,9 @@ static int burst_pop(AVCodecContext *avctx, AVPacket *pkt)
 /* Submit one buffered frame and stash whatever comes back. */
 static int submit_one(AVCodecContext *avctx, AVFrame *f)
 {
-    Next264Context *ctx = avctx->priv_data;
-    next264_picture_t pic;
-    next264_nal_t *nal;
+    Yah264Context *ctx = avctx->priv_data;
+    yah264_picture_t pic;
+    yah264_nal_t *nal;
     int nnal = 0, i, ret;
 
     memset(&pic, 0, sizeof(pic));
@@ -426,7 +426,7 @@ static int submit_one(AVCodecContext *avctx, AVFrame *f)
     ret = pts_push(ctx, f->pts);
     if (ret < 0)
         return ret;
-    ret = next264_encoder_encode(ctx->enc, &nal, &nnal, &pic);
+    ret = yah264_encoder_encode(ctx->enc, &nal, &nnal, &pic);
     if (ret < 0)
         return AVERROR_EXTERNAL;
     if (nnal > 0)
@@ -441,7 +441,7 @@ static int submit_one(AVCodecContext *avctx, AVFrame *f)
 
 static int drain_queue(AVCodecContext *avctx)
 {
-    Next264Context *ctx = avctx->priv_data;
+    Yah264Context *ctx = avctx->priv_data;
     int i, ret;
 
     for (i = 0; i < ctx->inq_count; i++) {
@@ -458,10 +458,10 @@ static int drain_queue(AVCodecContext *avctx)
     return 0;
 }
 
-static int next264_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
+static int yah264_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 {
-    Next264Context *ctx = avctx->priv_data;
-    next264_nal_t *nal;
+    Yah264Context *ctx = avctx->priv_data;
+    yah264_nal_t *nal;
     int nnal = 0, ret;
 
     ret = burst_pop(avctx, pkt);
@@ -509,7 +509,7 @@ static int next264_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
         }
 
         if (ctx->eof) {
-            ret = next264_encoder_encode(ctx->enc, &nal, &nnal, NULL);
+            ret = yah264_encoder_encode(ctx->enc, &nal, &nnal, NULL);
             if (ret < 0)
                 return AVERROR_EXTERNAL;
             if (nnal > 0) {
@@ -527,7 +527,7 @@ static int next264_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
     }
 }
 
-#define OFFSET(x) offsetof(Next264Context, x)
+#define OFFSET(x) offsetof(Yah264Context, x)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 
 static const AVOption options[] = {
@@ -546,35 +546,35 @@ static const AVOption options[] = {
     { NULL }
 };
 
-static const AVClass next264_class = {
-    .class_name = "libnext264",
+static const AVClass yah264_class = {
+    .class_name = "libyah264",
     .item_name  = av_default_item_name,
     .option     = options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-static const FFCodecDefault next264_defaults[] = {
+static const FFCodecDefault yah264_defaults[] = {
     { "b",  "0"  },   /* no default bitrate: absent selects CRF */
     { "g",  "-1" },
     { "bf", "-1" },
     { NULL },
 };
 
-const FFCodec ff_libnext264_encoder = {
-    .p.name         = "libnext264",
-    CODEC_LONG_NAME("libnext264 H.264 / AVC"),
+const FFCodec ff_libyah264_encoder = {
+    .p.name         = "libyah264",
+    CODEC_LONG_NAME("libyah264 H.264 / AVC"),
     .p.type         = AVMEDIA_TYPE_VIDEO,
     .p.id           = AV_CODEC_ID_H264,
     .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
                       AV_CODEC_CAP_OTHER_THREADS |
                       AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
-    .p.priv_class   = &next264_class,
-    .p.wrapper_name = "libnext264",
-    .priv_data_size = sizeof(Next264Context),
-    .init           = next264_init,
-    FF_CODEC_RECEIVE_PACKET_CB(next264_receive_packet),
-    .close          = next264_close,
-    .defaults       = next264_defaults,
+    .p.priv_class   = &yah264_class,
+    .p.wrapper_name = "libyah264",
+    .priv_data_size = sizeof(Yah264Context),
+    .init           = yah264_init,
+    FF_CODEC_RECEIVE_PACKET_CB(yah264_receive_packet),
+    .close          = yah264_close,
+    .defaults       = yah264_defaults,
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE |
                       FF_CODEC_CAP_AUTO_THREADS,
     CODEC_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P),
