@@ -103,12 +103,24 @@ static av_cold int yah264_close(AVCodecContext *avctx)
     return 0;
 }
 
+/* yah264's bit depth is fixed when the library is compiled, so one build takes
+ * 8-bit planes and another takes 16-bit ones, and the sample type this file was
+ * compiled against has to be the one the .so was. pkg-config carries the depth
+ * in its Cflags, which is how configure gets it right; the run-time check in
+ * init() is for the case where the library underneath us was swapped after
+ * that. Advertising both depths from one build is not possible. */
 static int yah264_csp_from_pixfmt(enum AVPixelFormat fmt)
 {
     switch (fmt) {
+#if Y264_BIT_DEPTH > 8
+    case AV_PIX_FMT_YUV420P10: return YAH264_CSP_I420;
+    case AV_PIX_FMT_YUV422P10: return YAH264_CSP_I422;
+    case AV_PIX_FMT_YUV444P10: return YAH264_CSP_I444;
+#else
     case AV_PIX_FMT_YUV420P: return YAH264_CSP_I420;
     case AV_PIX_FMT_YUV422P: return YAH264_CSP_I422;
     case AV_PIX_FMT_YUV444P: return YAH264_CSP_I444;
+#endif
     default:                 return -1;
     }
 }
@@ -120,6 +132,16 @@ static av_cold int yah264_init(AVCodecContext *avctx)
     yah264_nal_t *nal;
     int nnal, csp, i, size = 0;
     uint8_t *dst;
+
+    /* Both depths install under the same soname, so this mismatch links and
+     * loads; it shows up as every plane being read at half or double its
+     * stride. Fail here rather than encode garbage. */
+    if (yah264_bit_depth() != Y264_BIT_DEPTH) {
+        av_log(avctx, AV_LOG_ERROR,
+               "libyah264 is a %d-bit build, this wrapper was compiled for "
+               "%d-bit\n", yah264_bit_depth(), (int)Y264_BIT_DEPTH);
+        return AVERROR(EINVAL);
+    }
 
     csp = yah264_csp_from_pixfmt(avctx->pix_fmt);
     if (csp < 0) {
@@ -577,5 +599,10 @@ const FFCodec ff_libyah264_encoder = {
     .defaults       = yah264_defaults,
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE |
                       FF_CODEC_CAP_AUTO_THREADS,
+#if Y264_BIT_DEPTH > 8
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10,
+                  AV_PIX_FMT_YUV444P10),
+#else
     CODEC_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P),
+#endif
 };
