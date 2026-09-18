@@ -442,8 +442,11 @@ static int submit_one(AVCodecContext *avctx, AVFrame *f)
     pic.height = avctx->height;
     pic.pts    = f->pts;
     for (i = 0; i < 3; i++) {
-        pic.plane[i]  = (pixel *)f->data[i];
-        pic.stride[i] = f->linesize[i] / (int)sizeof(pixel);
+        /* ABI 2 dropped the public `pixel` typedef: planes are void* and the
+         * stride is in samples, so the byte width comes from the depth this
+         * wrapper was compiled at. */
+        pic.plane[i]  = f->data[i];
+        pic.stride[i] = f->linesize[i] / (Y264_BIT_DEPTH > 8 ? 2 : 1);
     }
     ret = pts_push(ctx, f->pts);
     if (ret < 0)
