@@ -225,9 +225,25 @@ static av_cold int yah264_init(AVCodecContext *avctx)
         return AVERROR_EXTERNAL;
     }
 
-    /* Input latency the encoder adds beyond B-frame reordering. Needed so the
-     * first dts values are placed early enough that dts <= pts always holds. */
-    ctx->delay_frames = yah264_lookahead_delay(p) + p->bframes;
+    /* dts trails pts by the stream's reorder depth and no more: the pyramid's
+     * depth, 1 for flat B, 0 without B. The encoder's input latency does not
+     * belong here. Counting it put the first dts seven frames early at the
+     * defaults, and a player that honours that offset stalls at the start.
+     * A bitrate or VBV mode may emit anchors early, so those keep the wide
+     * margin. */
+    if (p->bframes <= 0) {
+        ctx->delay_frames = 0;
+    } else if (p->rc.method == YAH264_RC_ABR ||
+               (p->rc.vbv_maxrate > 0 && p->rc.vbv_bufsize > 0)) {
+        ctx->delay_frames = yah264_lookahead_delay(p) + p->bframes;
+    } else if (p->b_pyramid && p->bframes >= 2) {
+        int d = 0;
+        while ((1 << d) < p->bframes + 1)
+            d++;
+        ctx->delay_frames = d;
+    } else {
+        ctx->delay_frames = 1;
+    }
 
     if (yah264_encoder_headers(ctx->enc, &nal, &nnal) < 0)
         return AVERROR_EXTERNAL;
