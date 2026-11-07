@@ -76,6 +76,7 @@ typedef struct Yah264Context {
     uint8_t *rep_ps;
     size_t   rep_ps_size;
     int      first_out;
+    int      hdr_warned;
     struct Yah264Out { uint8_t *data; size_t size; int key; int64_t pts; } *out;
     int      out_alloc;
     int      out_count;
@@ -137,28 +138,42 @@ static int yah264_csp_from_pixfmt(enum AVPixelFormat fmt)
     }
 }
 
-/* The colour enums in lavc carry the H.273 code points themselves, so they
- * pass through as numbers. Nothing is signalled unless something was set,
- * which keeps an untagged input's stream as it was. */
+/* lavc's colour enums carry the H.273 code points themselves, so they pass
+ * through as numbers. lavc's extended values (256 and up) have no H.273
+ * code and are left unsignalled, with a warning. */
+static int h273_code(AVCodecContext *avctx, const char *what, int v, int unset)
+{
+    if (v == unset)
+        return -1;
+    if (v < 0 || v > 255) {
+        av_log(avctx, AV_LOG_WARNING, "%s %d has no H.273 code; not signalled\n", what, v);
+        return -1;
+    }
+    return v;
+}
+
+/* Nothing is signalled unless something was set. Limited range on its own
+ * counts as nothing: it is what a decoder assumes without being told, so a
+ * Y4M input tagged limited codes as an untagged one would. */
 static int yah264_set_color(AVCodecContext *avctx, yah264_encoder_t *enc)
 {
     yah264_video_signal_t vs = { 0, 2, 2, 2, -1 };
-    int set = 0;
+    int set = 0, v;
 
-    if (avctx->color_range != AVCOL_RANGE_UNSPECIFIED) {
-        vs.full_range = avctx->color_range == AVCOL_RANGE_JPEG;
+    if (avctx->color_range == AVCOL_RANGE_JPEG) {
+        vs.full_range = 1;
         set = 1;
     }
-    if (avctx->color_primaries != AVCOL_PRI_UNSPECIFIED) {
-        vs.primaries = avctx->color_primaries;
+    if ((v = h273_code(avctx, "color_primaries", avctx->color_primaries, AVCOL_PRI_UNSPECIFIED)) >= 0) {
+        vs.primaries = v;
         set = 1;
     }
-    if (avctx->color_trc != AVCOL_TRC_UNSPECIFIED) {
-        vs.transfer = avctx->color_trc;
+    if ((v = h273_code(avctx, "color_trc", avctx->color_trc, AVCOL_TRC_UNSPECIFIED)) >= 0) {
+        vs.transfer = v;
         set = 1;
     }
-    if (avctx->colorspace != AVCOL_SPC_UNSPECIFIED) {
-        vs.matrix = avctx->colorspace;
+    if ((v = h273_code(avctx, "colorspace", avctx->colorspace, AVCOL_SPC_UNSPECIFIED)) >= 0) {
+        vs.matrix = v;
         set = 1;
     }
     /* lavc counts from 1 with 0 as unspecified; H.264's chroma_sample_loc_type
@@ -182,14 +197,43 @@ static unsigned rescale_clip(AVRational q, int unit, int64_t max)
     return v > max ? (unsigned)max : (unsigned)v;
 }
 
+/* Side data in the encoder's units, so a frame's can be compared with what
+ * init took. Returns 0 when there's nothing usable. The SEI needs the
+ * primaries and the luminance both, so side data with only one of them is
+ * skipped with a warning rather than written with zeroes for the other. */
+static int mdcv_units(AVCodecContext *avctx, const AVMasteringDisplayMetadata *m,
+                      unsigned prim[6], unsigned wp[2], unsigned lum[2], int warn)
+{
+    /* the SEI lists green, blue, red; lavc stores red, green, blue */
+    static const int order[3] = { 1, 2, 0 };
+
+    if (!m->has_primaries || !m->has_luminance) {
+        if (warn && (m->has_primaries || m->has_luminance))
+            av_log(avctx, AV_LOG_WARNING, "mastering display side data has %s only; "
+                   "the SEI needs both, so none is written\n",
+                   m->has_primaries ? "primaries" : "luminance");
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        prim[2 * i]     = rescale_clip(m->display_primaries[order[i]][0], 50000, 50000);
+        prim[2 * i + 1] = rescale_clip(m->display_primaries[order[i]][1], 50000, 50000);
+    }
+    wp[0]  = rescale_clip(m->white_point[0], 50000, 50000);
+    wp[1]  = rescale_clip(m->white_point[1], 50000, 50000);
+    lum[0] = rescale_clip(m->max_luminance, 10000, UINT32_MAX);
+    lum[1] = rescale_clip(m->min_luminance, 10000, UINT32_MAX);
+    return 1;
+}
+
 /* HDR10 metadata from the side data the caller attached to the context.
  * ffmpeg's own tool copies a stream's mastering display and light level
  * there from the first decoded frame, so a tagged input carries through.
- * The encoder takes these at open, so side data that first appears on a
- * later frame can't reach the stream. */
+ * The encoder takes these at open; a later frame whose side data differs is
+ * reported in submit_one. */
 static void yah264_hdr_side_data(AVCodecContext *avctx, yah264_param_t *p)
 {
     const AVFrameSideData *sd;
+    unsigned prim[6], wp[2], lum[2];
 
     sd = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
                                 AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
@@ -201,75 +245,70 @@ static void yah264_hdr_side_data(AVCodecContext *avctx, yah264_param_t *p)
 
     sd = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
                                 AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
-    if (sd) {
-        const AVMasteringDisplayMetadata *m = (const AVMasteringDisplayMetadata *)sd->data;
-        /* the SEI lists green, blue, red; lavc stores red, green, blue */
-        static const int order[3] = { 1, 2, 0 };
-        int i;
-
-        if (!m->has_primaries && !m->has_luminance)
-            return;
+    if (sd && mdcv_units(avctx, (const AVMasteringDisplayMetadata *)sd->data, prim, wp, lum, 1)) {
+        memcpy(p->mastering_prim, prim, sizeof(prim));
+        memcpy(p->mastering_wp, wp, sizeof(wp));
+        p->mastering_max = lum[0];
+        p->mastering_min = lum[1];
         p->mastering_set = 1;
-        if (m->has_primaries) {
-            for (i = 0; i < 3; i++) {
-                p->mastering_prim[2 * i]     = rescale_clip(m->display_primaries[order[i]][0], 50000, 50000);
-                p->mastering_prim[2 * i + 1] = rescale_clip(m->display_primaries[order[i]][1], 50000, 50000);
-            }
-            p->mastering_wp[0] = rescale_clip(m->white_point[0], 50000, 50000);
-            p->mastering_wp[1] = rescale_clip(m->white_point[1], 50000, 50000);
-        }
-        if (m->has_luminance) {
-            p->mastering_max = rescale_clip(m->max_luminance, 10000, UINT32_MAX);
-            p->mastering_min = rescale_clip(m->min_luminance, 10000, UINT32_MAX);
-        }
     }
 }
 
-/* The private options take the command-line encoder's syntax, so a value
- * from one works in the other: G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min) in the
- * SEI's own units, and MaxCLL,MaxFALL in cd/m^2. They win over side data. */
+/* Once per encode: the first frame whose mastering display or light level
+ * differs from what open took. Nothing can change it mid-stream, so it is
+ * only reported. */
+static void yah264_hdr_frame_check(AVCodecContext *avctx, Yah264Context *ctx, const AVFrame *f)
+{
+    const yah264_param_t *p = &ctx->params;
+    const AVFrameSideData *sd;
+    unsigned prim[6], wp[2], lum[2];
+    int differs = 0;
+
+    if (ctx->hdr_warned)
+        return;
+    sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (sd) {
+        const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd->data;
+        differs |= (int)FFMIN(cll->MaxCLL, 65535) != p->cll_max ||
+                   (int)FFMIN(cll->MaxFALL, 65535) != p->cll_avg;
+    }
+    sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd && mdcv_units(avctx, (const AVMasteringDisplayMetadata *)sd->data, prim, wp, lum, 0))
+        differs |= !p->mastering_set || memcmp(prim, p->mastering_prim, sizeof(prim)) ||
+                   memcmp(wp, p->mastering_wp, sizeof(wp)) ||
+                   lum[0] != p->mastering_max || lum[1] != p->mastering_min;
+    if (differs) {
+        av_log(avctx, AV_LOG_WARNING, "frame %"PRId64" carries mastering display or light "
+               "level side data that differs from the stream's; the encoder writes what "
+               "it took at init (put it on the codec context, or use -mastering-display "
+               "and -cll)\n", f->pts);
+        ctx->hdr_warned = 1;
+    }
+}
+
+/* The private options take the command-line encoder's syntax and go through
+ * the library's own parser, so they are checked the same way. They win over
+ * side data. */
 static int yah264_hdr_options(AVCodecContext *avctx, Yah264Context *ctx, yah264_param_t *p)
 {
-    if (ctx->mastering_display) {
-        unsigned v[10];
-        long long lmax, lmin;
-        char tail;
+    char why[256];
+    int r;
 
-        if (sscanf(ctx->mastering_display, "G(%u,%u)B(%u,%u)R(%u,%u)WP(%u,%u)L(%lld,%lld)%c",
-                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
-                   &lmax, &lmin, &tail) != 10 ||
-            lmax < 0 || lmin < 0 || lmax > UINT32_MAX || lmin > UINT32_MAX) {
-            av_log(avctx, AV_LOG_ERROR, "mastering-display expects "
-                   "G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), got '%s'\n",
-                   ctx->mastering_display);
+    if (ctx->mastering_display) {
+        r = yah264_param_parse_mastering(p, ctx->mastering_display, why, sizeof(why));
+        if (r < 0) {
+            av_log(avctx, AV_LOG_ERROR, "mastering-display %s\n", why);
             return AVERROR(EINVAL);
         }
-        for (int i = 0; i < 8; i++) {
-            if (v[i] > 50000) {
-                av_log(avctx, AV_LOG_ERROR, "mastering-display: chromaticity "
-                       "%u is above 50000 (1.0)\n", v[i]);
-                return AVERROR(EINVAL);
-            }
-        }
-        memcpy(p->mastering_prim, v, sizeof(p->mastering_prim));
-        p->mastering_wp[0] = v[6];
-        p->mastering_wp[1] = v[7];
-        p->mastering_max = (unsigned)lmax;
-        p->mastering_min = (unsigned)lmin;
-        p->mastering_set = 1;
+        if (r > 0)
+            av_log(avctx, AV_LOG_WARNING, "mastering-display %s\n", why);
     }
     if (ctx->cll) {
-        int max, avg;
-        char tail;
-
-        if (sscanf(ctx->cll, "%d,%d%c", &max, &avg, &tail) != 2 ||
-            max < 0 || avg < 0 || max > 65535 || avg > 65535) {
-            av_log(avctx, AV_LOG_ERROR, "cll expects MaxCLL,MaxFALL, each "
-                   "0..65535, got '%s'\n", ctx->cll);
+        r = yah264_param_parse_cll(p, ctx->cll, why, sizeof(why));
+        if (r < 0) {
+            av_log(avctx, AV_LOG_ERROR, "cll %s\n", why);
             return AVERROR(EINVAL);
         }
-        p->cll_max = max;
-        p->cll_avg = avg;
     }
     return 0;
 }
@@ -415,8 +454,9 @@ static av_cold int yah264_init(AVCodecContext *avctx)
 
     /* A global header holds the parameter sets only: an MP4 or Matroska
      * muxer rebuilds it as a decoder configuration record, which has no
-     * place for SEI, so SEI there would be dropped on the way into the file.
-     * The SEI rides in-band ahead of the first slice instead. Without a
+     * place for SEI. The encoder already writes its display metadata in-band
+     * at every key; what SEI the headers still carry (the settings record, a
+     * buffering period) rides in-band ahead of the first slice. Without a
      * global header everything goes in-band ahead of the first slice. */
     for (i = 0; i < nnal; i++) {
         int is_ps = nal[i].type == YAH264_NAL_SPS || nal[i].type == YAH264_NAL_PPS;
@@ -632,6 +672,7 @@ static int submit_one(AVCodecContext *avctx, AVFrame *f)
     yah264_nal_t *nal;
     int nnal = 0, i, ret;
 
+    yah264_hdr_frame_check(avctx, ctx, f);
     memset(&pic, 0, sizeof(pic));
     pic.csp    = ctx->params.csp;
     pic.width  = avctx->width;
@@ -800,7 +841,7 @@ const FFCodec ff_libyah264_encoder = {
     FF_CODEC_RECEIVE_PACKET_CB(yah264_receive_packet),
     .close          = yah264_close,
     .defaults       = yah264_defaults,
-    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE |
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP |
                       FF_CODEC_CAP_AUTO_THREADS,
 #if Y264_BIT_DEPTH > 8
     CODEC_PIXFMTS(AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10,
