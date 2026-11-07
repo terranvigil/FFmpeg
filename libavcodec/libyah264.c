@@ -177,8 +177,10 @@ static int yah264_set_color(AVCodecContext *avctx, yah264_encoder_t *enc)
         set = 1;
     }
     /* lavc counts from 1 with 0 as unspecified; H.264's chroma_sample_loc_type
-     * counts from 0 in the same order */
-    if (avctx->chroma_sample_location != AVCHROMA_LOC_UNSPECIFIED) {
+     * counts from 0 in the same order. It only means something at 4:2:0, and
+     * E.2.1 wants it absent otherwise. */
+    if (avctx->chroma_sample_location != AVCHROMA_LOC_UNSPECIFIED &&
+        ((Yah264Context *)avctx->priv_data)->params.csp == YAH264_CSP_I420) {
         vs.chroma_loc = avctx->chroma_sample_location - 1;
         set = 1;
     }
@@ -235,12 +237,14 @@ static int mdcv_units(AVCodecContext *avctx, const AVMasteringDisplayMetadata *m
  * there from the first decoded frame, so a tagged input carries through.
  * The encoder takes these at open; a later frame whose side data differs is
  * reported in submit_one. */
-static void yah264_hdr_side_data(AVCodecContext *avctx, yah264_param_t *p)
+static void yah264_hdr_side_data(AVCodecContext *avctx, Yah264Context *ctx, yah264_param_t *p)
 {
     const AVFrameSideData *sd;
     unsigned prim[6], wp[2], lum[2];
 
-    sd = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+    /* a field a private option sets is taken from the option, so its side
+     * data is neither read nor warned about */
+    sd = ctx->cll ? NULL : av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
                                 AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
     if (sd) {
         const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd->data;
@@ -248,7 +252,8 @@ static void yah264_hdr_side_data(AVCodecContext *avctx, yah264_param_t *p)
         p->cll_avg = FFMIN(cll->MaxFALL, 65535);
     }
 
-    sd = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+    sd = ctx->mastering_display ? NULL
+       : av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
                                 AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
     if (sd && mdcv_units(avctx, (const AVMasteringDisplayMetadata *)sd->data, prim, wp, lum, 1)) {
         memcpy(p->mastering_prim, prim, sizeof(prim));
@@ -286,7 +291,7 @@ static void yah264_hdr_frame_check(AVCodecContext *avctx, Yah264Context *ctx, co
                    memcmp(wp, p->mastering_wp, sizeof(wp)) ||
                    lum[0] != p->mastering_max || lum[1] != p->mastering_min;
     if (differs) {
-        av_log(avctx, AV_LOG_WARNING, "frame %"PRId64" carries mastering display or light "
+        av_log(avctx, AV_LOG_WARNING, "the frame at pts %"PRId64" carries mastering display or light "
                "level side data that differs from the stream's; the encoder writes what "
                "it took at init (put it on the codec context, or use -mastering-display "
                "and -cll)\n", f->pts);
@@ -317,6 +322,8 @@ static int yah264_hdr_options(AVCodecContext *avctx, Yah264Context *ctx, yah264_
             av_log(avctx, AV_LOG_ERROR, "cll %s\n", why);
             return AVERROR(EINVAL);
         }
+        if (r > 0)
+            av_log(avctx, AV_LOG_WARNING, "cll %s\n", why);
     }
     return 0;
 }
@@ -425,7 +432,7 @@ static av_cold int yah264_init(AVCodecContext *avctx)
         p->sar_den = avctx->sample_aspect_ratio.den;
     }
 
-    yah264_hdr_side_data(avctx, p);
+    yah264_hdr_side_data(avctx, ctx, p);
     if ((ret = yah264_hdr_options(avctx, ctx, p)) < 0)
         return ret;
 
