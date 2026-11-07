@@ -184,7 +184,12 @@ static int yah264_set_color(AVCodecContext *avctx, yah264_encoder_t *enc)
     }
     if (!set)
         return 0;
-    return yah264_encoder_set_video_signal(enc, &vs) < 0 ? AVERROR_EXTERNAL : 0;
+    if (yah264_encoder_set_video_signal(enc, &vs) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "the encoder refused the colour description "
+               "(colorspace %d at this pixel format; GBR needs 4:4:4)\n", vs.matrix);
+        return AVERROR(EINVAL);
+    }
+    return 0;
 }
 
 static unsigned rescale_clip(AVRational q, int unit, int64_t max)
@@ -266,13 +271,16 @@ static void yah264_hdr_frame_check(AVCodecContext *avctx, Yah264Context *ctx, co
 
     if (ctx->hdr_warned)
         return;
-    sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    /* a field a private option set is what the user asked for, whatever
+     * the frames carry */
+    sd = ctx->cll ? NULL : av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
     if (sd) {
         const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd->data;
         differs |= (int)FFMIN(cll->MaxCLL, 65535) != p->cll_max ||
                    (int)FFMIN(cll->MaxFALL, 65535) != p->cll_avg;
     }
-    sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    sd = ctx->mastering_display ? NULL
+       : av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
     if (sd && mdcv_units(avctx, (const AVMasteringDisplayMetadata *)sd->data, prim, wp, lum, 0))
         differs |= !p->mastering_set || memcmp(prim, p->mastering_prim, sizeof(prim)) ||
                    memcmp(wp, p->mastering_wp, sizeof(wp)) ||
