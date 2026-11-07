@@ -21,6 +21,8 @@
 #include <yah264.h>
 
 #include "libavutil/cpu.h"
+#include "libavutil/frame.h"
+#include "libavutil/mastering_display_metadata.h"
 #include "libavutil/opt.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
@@ -43,6 +45,8 @@ typedef struct Yah264Context {
     int   trellis_opt;
     float aq_strength;
     float psy_rd;
+    char *mastering_display;
+    char *cll;
 
     /* Input timestamps kept BY DISPLAY INDEX, because that is the key the
      * encoder reports its output against. The encoder reorders, so a packet's
@@ -65,6 +69,13 @@ typedef struct Yah264Context {
      * decode at all. */
     uint8_t *hdr;
     size_t   hdr_size;
+    /* Without a global header, every IDR after the first carries the
+     * parameter sets again, so a reader that starts or seeks there (a
+     * transport stream, raw Annex-B) can decode it. The encoder writes them
+     * once; its display-metadata SEI it repeats at every IDR itself. */
+    uint8_t *rep_ps;
+    size_t   rep_ps_size;
+    int      first_out;
     struct Yah264Out { uint8_t *data; size_t size; int key; int64_t pts; } *out;
     int      out_alloc;
     int      out_count;
@@ -97,6 +108,7 @@ static av_cold int yah264_close(AVCodecContext *avctx)
         av_freep(&ctx->out[--ctx->out_count].data);
     av_freep(&ctx->out);
     av_freep(&ctx->hdr);
+    av_freep(&ctx->rep_ps);
     while (ctx->inq_count > 0)
         av_frame_free(&ctx->inq[--ctx->inq_count]);
     av_freep(&ctx->inq);
@@ -125,13 +137,160 @@ static int yah264_csp_from_pixfmt(enum AVPixelFormat fmt)
     }
 }
 
+/* The colour enums in lavc carry the H.273 code points themselves, so they
+ * pass through as numbers. Nothing is signalled unless something was set,
+ * which keeps an untagged input's stream as it was. */
+static int yah264_set_color(AVCodecContext *avctx, yah264_encoder_t *enc)
+{
+    yah264_video_signal_t vs = { 0, 2, 2, 2, -1 };
+    int set = 0;
+
+    if (avctx->color_range != AVCOL_RANGE_UNSPECIFIED) {
+        vs.full_range = avctx->color_range == AVCOL_RANGE_JPEG;
+        set = 1;
+    }
+    if (avctx->color_primaries != AVCOL_PRI_UNSPECIFIED) {
+        vs.primaries = avctx->color_primaries;
+        set = 1;
+    }
+    if (avctx->color_trc != AVCOL_TRC_UNSPECIFIED) {
+        vs.transfer = avctx->color_trc;
+        set = 1;
+    }
+    if (avctx->colorspace != AVCOL_SPC_UNSPECIFIED) {
+        vs.matrix = avctx->colorspace;
+        set = 1;
+    }
+    /* lavc counts from 1 with 0 as unspecified; H.264's chroma_sample_loc_type
+     * counts from 0 in the same order */
+    if (avctx->chroma_sample_location != AVCHROMA_LOC_UNSPECIFIED) {
+        vs.chroma_loc = avctx->chroma_sample_location - 1;
+        set = 1;
+    }
+    if (!set)
+        return 0;
+    return yah264_encoder_set_video_signal(enc, &vs) < 0 ? AVERROR_EXTERNAL : 0;
+}
+
+static unsigned rescale_clip(AVRational q, int unit, int64_t max)
+{
+    int64_t v;
+
+    if (q.den <= 0 || q.num < 0)
+        return 0;
+    v = av_rescale(q.num, unit, q.den);
+    return v > max ? (unsigned)max : (unsigned)v;
+}
+
+/* HDR10 metadata from the side data the caller attached to the context.
+ * ffmpeg's own tool copies a stream's mastering display and light level
+ * there from the first decoded frame, so a tagged input carries through.
+ * The encoder takes these at open, so side data that first appears on a
+ * later frame can't reach the stream. */
+static void yah264_hdr_side_data(AVCodecContext *avctx, yah264_param_t *p)
+{
+    const AVFrameSideData *sd;
+
+    sd = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+                                AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (sd) {
+        const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd->data;
+        p->cll_max = FFMIN(cll->MaxCLL, 65535);
+        p->cll_avg = FFMIN(cll->MaxFALL, 65535);
+    }
+
+    sd = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+                                AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd) {
+        const AVMasteringDisplayMetadata *m = (const AVMasteringDisplayMetadata *)sd->data;
+        /* the SEI lists green, blue, red; lavc stores red, green, blue */
+        static const int order[3] = { 1, 2, 0 };
+        int i;
+
+        if (!m->has_primaries && !m->has_luminance)
+            return;
+        p->mastering_set = 1;
+        if (m->has_primaries) {
+            for (i = 0; i < 3; i++) {
+                p->mastering_prim[2 * i]     = rescale_clip(m->display_primaries[order[i]][0], 50000, 50000);
+                p->mastering_prim[2 * i + 1] = rescale_clip(m->display_primaries[order[i]][1], 50000, 50000);
+            }
+            p->mastering_wp[0] = rescale_clip(m->white_point[0], 50000, 50000);
+            p->mastering_wp[1] = rescale_clip(m->white_point[1], 50000, 50000);
+        }
+        if (m->has_luminance) {
+            p->mastering_max = rescale_clip(m->max_luminance, 10000, UINT32_MAX);
+            p->mastering_min = rescale_clip(m->min_luminance, 10000, UINT32_MAX);
+        }
+    }
+}
+
+/* The private options take the command-line encoder's syntax, so a value
+ * from one works in the other: G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min) in the
+ * SEI's own units, and MaxCLL,MaxFALL in cd/m^2. They win over side data. */
+static int yah264_hdr_options(AVCodecContext *avctx, Yah264Context *ctx, yah264_param_t *p)
+{
+    if (ctx->mastering_display) {
+        unsigned v[10];
+        long long lmax, lmin;
+        char tail;
+
+        if (sscanf(ctx->mastering_display, "G(%u,%u)B(%u,%u)R(%u,%u)WP(%u,%u)L(%lld,%lld)%c",
+                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
+                   &lmax, &lmin, &tail) != 10 ||
+            lmax < 0 || lmin < 0 || lmax > UINT32_MAX || lmin > UINT32_MAX) {
+            av_log(avctx, AV_LOG_ERROR, "mastering-display expects "
+                   "G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min), got '%s'\n",
+                   ctx->mastering_display);
+            return AVERROR(EINVAL);
+        }
+        for (int i = 0; i < 8; i++) {
+            if (v[i] > 50000) {
+                av_log(avctx, AV_LOG_ERROR, "mastering-display: chromaticity "
+                       "%u is above 50000 (1.0)\n", v[i]);
+                return AVERROR(EINVAL);
+            }
+        }
+        memcpy(p->mastering_prim, v, sizeof(p->mastering_prim));
+        p->mastering_wp[0] = v[6];
+        p->mastering_wp[1] = v[7];
+        p->mastering_max = (unsigned)lmax;
+        p->mastering_min = (unsigned)lmin;
+        p->mastering_set = 1;
+    }
+    if (ctx->cll) {
+        int max, avg;
+        char tail;
+
+        if (sscanf(ctx->cll, "%d,%d%c", &max, &avg, &tail) != 2 ||
+            max < 0 || avg < 0 || max > 65535 || avg > 65535) {
+            av_log(avctx, AV_LOG_ERROR, "cll expects MaxCLL,MaxFALL, each "
+                   "0..65535, got '%s'\n", ctx->cll);
+            return AVERROR(EINVAL);
+        }
+        p->cll_max = max;
+        p->cll_avg = avg;
+    }
+    return 0;
+}
+
+static int append_bytes(uint8_t **buf, size_t *size, const yah264_nal_t *n)
+{
+    uint8_t *p = av_realloc(*buf, *size + n->size);
+    if (!p)
+        return AVERROR(ENOMEM);
+    memcpy(p + *size, n->payload, n->size);
+    *buf = p;
+    *size += n->size;
+    return 0;
+}
+
 static av_cold int yah264_init(AVCodecContext *avctx)
 {
     Yah264Context *ctx = avctx->priv_data;
     yah264_param_t *p = &ctx->params;
     yah264_nal_t *nal;
-    int nnal, csp, i, size = 0;
-    uint8_t *dst;
+    int nnal, csp, i, ret;
 
     /* Both depths install under the same soname, so this mismatch links and
      * loads; it shows up as every plane being read at half or double its
@@ -219,11 +378,17 @@ static av_cold int yah264_init(AVCodecContext *avctx)
         p->sar_den = avctx->sample_aspect_ratio.den;
     }
 
+    yah264_hdr_side_data(avctx, p);
+    if ((ret = yah264_hdr_options(avctx, ctx, p)) < 0)
+        return ret;
+
     ctx->enc = yah264_encoder_open(p);
     if (!ctx->enc) {
         av_log(avctx, AV_LOG_ERROR, "yah264_encoder_open failed\n");
         return AVERROR_EXTERNAL;
     }
+    if ((ret = yah264_set_color(avctx, ctx->enc)) < 0)
+        return ret;
 
     /* dts trails pts by the stream's reorder depth and no more: the pyramid's
      * depth, 1 for flat B, 0 without B. The encoder's input latency does not
@@ -247,30 +412,32 @@ static av_cold int yah264_init(AVCodecContext *avctx)
 
     if (yah264_encoder_headers(ctx->enc, &nal, &nnal) < 0)
         return AVERROR_EXTERNAL;
-    for (i = 0; i < nnal; i++)
-        size += nal[i].size;
 
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
-        avctx->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
-        if (!avctx->extradata)
-            return AVERROR(ENOMEM);
-        dst = avctx->extradata;
-        for (i = 0; i < nnal; i++) {
-            memcpy(dst, nal[i].payload, nal[i].size);
-            dst += nal[i].size;
+    /* A global header holds the parameter sets only: an MP4 or Matroska
+     * muxer rebuilds it as a decoder configuration record, which has no
+     * place for SEI, so SEI there would be dropped on the way into the file.
+     * The SEI rides in-band ahead of the first slice instead. Without a
+     * global header everything goes in-band ahead of the first slice. */
+    for (i = 0; i < nnal; i++) {
+        int is_ps = nal[i].type == YAH264_NAL_SPS || nal[i].type == YAH264_NAL_PPS;
+
+        if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) && is_ps) {
+            uint8_t *x = av_realloc(avctx->extradata, avctx->extradata_size + nal[i].size +
+                                    AV_INPUT_BUFFER_PADDING_SIZE);
+            if (!x)
+                return AVERROR(ENOMEM);
+            memcpy(x + avctx->extradata_size, nal[i].payload, nal[i].size);
+            avctx->extradata = x;
+            avctx->extradata_size += nal[i].size;
+            memset(x + avctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+        } else if ((ret = append_bytes(&ctx->hdr, &ctx->hdr_size, &nal[i])) < 0) {
+            return ret;
         }
-        avctx->extradata_size = size;
-    } else {
-        ctx->hdr = av_malloc(size);
-        if (!ctx->hdr)
-            return AVERROR(ENOMEM);
-        dst = ctx->hdr;
-        for (i = 0; i < nnal; i++) {
-            memcpy(dst, nal[i].payload, nal[i].size);
-            dst += nal[i].size;
-        }
-        ctx->hdr_size = size;
+        if (is_ps && !(avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) &&
+            (ret = append_bytes(&ctx->rep_ps, &ctx->rep_ps_size, &nal[i])) < 0)
+            return ret;
     }
+    ctx->first_out = 1;
 
     ctx->pts_alloc = 64;
     ctx->pts_by_disp = av_malloc_array(ctx->pts_alloc, sizeof(*ctx->pts_by_disp));
@@ -370,7 +537,7 @@ static int burst_stash(Yah264Context *ctx, yah264_nal_t *nal, int nnal)
         /* [start .. i] is one coded frame: leading non-slice units plus the
          * slice itself. */
         {
-            size_t size = 0;
+            size_t size = 0, ps = 0;
             int j, key = 0;
             uint8_t *buf;
             for (j = start; j <= i; j++) {
@@ -378,12 +545,25 @@ static int burst_stash(Yah264Context *ctx, yah264_nal_t *nal, int nnal)
                 if (nal[j].type == YAH264_NAL_SLICE_IDR)
                     key = 1;
             }
-            buf = av_malloc(size);
+            /* the first IDR takes the headers from burst_pop instead */
+            if (key && !ctx->first_out)
+                ps = ctx->rep_ps_size;
+            if (key)
+                ctx->first_out = 0;
+            buf = av_malloc(size + ps);
             if (!buf)
                 return AVERROR(ENOMEM);
             {
                 uint8_t *d = buf;
+                int done = !ps;
                 for (j = start; j <= i; j++) {
+                    /* after a delimiter, ahead of any SEI: a buffering
+                     * period names the SPS it belongs to */
+                    if (!done && nal[j].type != 9 /* AUD */) {
+                        memcpy(d, ctx->rep_ps, ps);
+                        d += ps;
+                        done = 1;
+                    }
                     memcpy(d, nal[j].payload, nal[j].size);
                     d += nal[j].size;
                 }
@@ -396,7 +576,7 @@ static int burst_stash(Yah264Context *ctx, yah264_nal_t *nal, int nnal)
                 ctx->out_alloc = n;
             }
             ctx->out[ctx->out_count].data = buf;
-            ctx->out[ctx->out_count].size = size;
+            ctx->out[ctx->out_count].size = size + ps;
             ctx->out[ctx->out_count].key  = key;
             ctx->out_count++;
         }
@@ -584,6 +764,10 @@ static const AVOption options[] = {
       AV_OPT_TYPE_FLOAT, { .dbl = -1 }, -1, 4, VE },
     { "psy-rd", "psychovisual RD strength (-1 = default)", OFFSET(psy_rd),
       AV_OPT_TYPE_FLOAT, { .dbl = -1 }, -1, 4, VE },
+    { "mastering-display", "mastering display SEI, G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min) "
+      "(over side data)", OFFSET(mastering_display), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
+    { "cll", "content light level SEI, MaxCLL,MaxFALL in cd/m^2 (over side data)",
+      OFFSET(cll), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
     { NULL }
 };
 
