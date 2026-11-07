@@ -21,6 +21,8 @@
 #include <yah264.h>
 
 #include "libavutil/cpu.h"
+#include "libavutil/frame.h"
+#include "libavutil/mastering_display_metadata.h"
 #include "libavutil/opt.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
@@ -43,6 +45,8 @@ typedef struct Yah264Context {
     int   trellis_opt;
     float aq_strength;
     float psy_rd;
+    char *mastering_display;
+    char *cll;
 
     /* Input timestamps kept BY DISPLAY INDEX, because that is the key the
      * encoder reports its output against. The encoder reorders, so a packet's
@@ -65,6 +69,14 @@ typedef struct Yah264Context {
      * decode at all. */
     uint8_t *hdr;
     size_t   hdr_size;
+    /* Without a global header, every IDR after the first carries the
+     * parameter sets again, so a reader that starts or seeks there (a
+     * transport stream, raw Annex-B) can decode it. The encoder writes them
+     * once; its display-metadata SEI it repeats at every IDR itself. */
+    uint8_t *rep_ps;
+    size_t   rep_ps_size;
+    int      first_out;
+    int      hdr_warned;
     struct Yah264Out { uint8_t *data; size_t size; int key; int64_t pts; } *out;
     int      out_alloc;
     int      out_count;
@@ -97,6 +109,7 @@ static av_cold int yah264_close(AVCodecContext *avctx)
         av_freep(&ctx->out[--ctx->out_count].data);
     av_freep(&ctx->out);
     av_freep(&ctx->hdr);
+    av_freep(&ctx->rep_ps);
     while (ctx->inq_count > 0)
         av_frame_free(&ctx->inq[--ctx->inq_count]);
     av_freep(&ctx->inq);
@@ -125,13 +138,213 @@ static int yah264_csp_from_pixfmt(enum AVPixelFormat fmt)
     }
 }
 
+/* lavc's colour enums carry the H.273 code points themselves, so they pass
+ * through as numbers. lavc's extended values (256 and up) have no H.273
+ * code and are left unsignalled, with a warning. */
+static int h273_code(AVCodecContext *avctx, const char *what, int v, int unset)
+{
+    if (v == unset)
+        return -1;
+    if (v < 0 || v > 255) {
+        av_log(avctx, AV_LOG_WARNING, "%s %d has no H.273 code; not signalled\n", what, v);
+        return -1;
+    }
+    return v;
+}
+
+/* Nothing is signalled unless something was set. Limited range on its own
+ * counts as nothing: it is what a decoder assumes without being told, so a
+ * Y4M input tagged limited codes as an untagged one would. */
+static int yah264_set_color(AVCodecContext *avctx, yah264_encoder_t *enc)
+{
+    yah264_video_signal_t vs = { 0, 2, 2, 2, -1 };
+    int set = 0, v;
+
+    if (avctx->color_range == AVCOL_RANGE_JPEG) {
+        vs.full_range = 1;
+        set = 1;
+    }
+    if ((v = h273_code(avctx, "color_primaries", avctx->color_primaries, AVCOL_PRI_UNSPECIFIED)) >= 0) {
+        vs.primaries = v;
+        set = 1;
+    }
+    if ((v = h273_code(avctx, "color_trc", avctx->color_trc, AVCOL_TRC_UNSPECIFIED)) >= 0) {
+        vs.transfer = v;
+        set = 1;
+    }
+    if ((v = h273_code(avctx, "colorspace", avctx->colorspace, AVCOL_SPC_UNSPECIFIED)) >= 0) {
+        vs.matrix = v;
+        set = 1;
+    }
+    /* lavc counts from 1 with 0 as unspecified; H.264's chroma_sample_loc_type
+     * counts from 0 in the same order. It only means something at 4:2:0, and
+     * E.2.1 wants it absent otherwise. */
+    if (avctx->chroma_sample_location != AVCHROMA_LOC_UNSPECIFIED &&
+        ((Yah264Context *)avctx->priv_data)->params.csp == YAH264_CSP_I420) {
+        vs.chroma_loc = avctx->chroma_sample_location - 1;
+        set = 1;
+    }
+    if (!set)
+        return 0;
+    if (yah264_encoder_set_video_signal(enc, &vs) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "the encoder refused the colour description "
+               "(colorspace %d at this pixel format; GBR needs 4:4:4)\n", vs.matrix);
+        return AVERROR(EINVAL);
+    }
+    return 0;
+}
+
+static unsigned rescale_clip(AVRational q, int unit, int64_t max)
+{
+    int64_t v;
+
+    if (q.den <= 0 || q.num < 0)
+        return 0;
+    v = av_rescale(q.num, unit, q.den);
+    return v > max ? (unsigned)max : (unsigned)v;
+}
+
+/* Side data in the encoder's units, so a frame's can be compared with what
+ * init took. Returns 0 when there's nothing usable. The SEI needs the
+ * primaries and the luminance both, so side data with only one of them is
+ * skipped with a warning rather than written with zeroes for the other. */
+static int mdcv_units(AVCodecContext *avctx, const AVMasteringDisplayMetadata *m,
+                      unsigned prim[6], unsigned wp[2], unsigned lum[2], int warn)
+{
+    /* the SEI lists green, blue, red; lavc stores red, green, blue */
+    static const int order[3] = { 1, 2, 0 };
+
+    if (!m->has_primaries || !m->has_luminance) {
+        if (warn && (m->has_primaries || m->has_luminance))
+            av_log(avctx, AV_LOG_WARNING, "mastering display side data has %s only; "
+                   "the SEI needs both, so none is written\n",
+                   m->has_primaries ? "primaries" : "luminance");
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        prim[2 * i]     = rescale_clip(m->display_primaries[order[i]][0], 50000, 50000);
+        prim[2 * i + 1] = rescale_clip(m->display_primaries[order[i]][1], 50000, 50000);
+    }
+    wp[0]  = rescale_clip(m->white_point[0], 50000, 50000);
+    wp[1]  = rescale_clip(m->white_point[1], 50000, 50000);
+    lum[0] = rescale_clip(m->max_luminance, 10000, UINT32_MAX);
+    lum[1] = rescale_clip(m->min_luminance, 10000, UINT32_MAX);
+    return 1;
+}
+
+/* HDR10 metadata from the side data the caller attached to the context.
+ * ffmpeg's own tool copies a stream's mastering display and light level
+ * there from the first decoded frame, so a tagged input carries through.
+ * The encoder takes these at open; a later frame whose side data differs is
+ * reported in submit_one. */
+static void yah264_hdr_side_data(AVCodecContext *avctx, Yah264Context *ctx, yah264_param_t *p)
+{
+    const AVFrameSideData *sd;
+    unsigned prim[6], wp[2], lum[2];
+
+    /* a field a private option sets is taken from the option, so its side
+     * data is neither read nor warned about */
+    sd = ctx->cll ? NULL : av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+                                AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (sd) {
+        const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd->data;
+        p->cll_max = FFMIN(cll->MaxCLL, 65535);
+        p->cll_avg = FFMIN(cll->MaxFALL, 65535);
+    }
+
+    sd = ctx->mastering_display ? NULL
+       : av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+                                AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd && mdcv_units(avctx, (const AVMasteringDisplayMetadata *)sd->data, prim, wp, lum, 1)) {
+        memcpy(p->mastering_prim, prim, sizeof(prim));
+        memcpy(p->mastering_wp, wp, sizeof(wp));
+        p->mastering_max = lum[0];
+        p->mastering_min = lum[1];
+        p->mastering_set = 1;
+    }
+}
+
+/* Once per encode: the first frame whose mastering display or light level
+ * differs from what open took. Nothing can change it mid-stream, so it is
+ * only reported. */
+static void yah264_hdr_frame_check(AVCodecContext *avctx, Yah264Context *ctx, const AVFrame *f)
+{
+    const yah264_param_t *p = &ctx->params;
+    const AVFrameSideData *sd;
+    unsigned prim[6], wp[2], lum[2];
+    int differs = 0;
+
+    if (ctx->hdr_warned)
+        return;
+    /* a field a private option set is what the user asked for, whatever
+     * the frames carry */
+    sd = ctx->cll ? NULL : av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (sd) {
+        const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd->data;
+        differs |= (int)FFMIN(cll->MaxCLL, 65535) != p->cll_max ||
+                   (int)FFMIN(cll->MaxFALL, 65535) != p->cll_avg;
+    }
+    sd = ctx->mastering_display ? NULL
+       : av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd && mdcv_units(avctx, (const AVMasteringDisplayMetadata *)sd->data, prim, wp, lum, 0))
+        differs |= !p->mastering_set || memcmp(prim, p->mastering_prim, sizeof(prim)) ||
+                   memcmp(wp, p->mastering_wp, sizeof(wp)) ||
+                   lum[0] != p->mastering_max || lum[1] != p->mastering_min;
+    if (differs) {
+        av_log(avctx, AV_LOG_WARNING, "the frame at pts %"PRId64" carries mastering display or light "
+               "level side data that differs from the stream's; the encoder writes what "
+               "it took at init (put it on the codec context, or use -mastering-display "
+               "and -cll)\n", f->pts);
+        ctx->hdr_warned = 1;
+    }
+}
+
+/* The private options take the command-line encoder's syntax and go through
+ * the library's own parser, so they are checked the same way. They win over
+ * side data. */
+static int yah264_hdr_options(AVCodecContext *avctx, Yah264Context *ctx, yah264_param_t *p)
+{
+    char why[256];
+    int r;
+
+    if (ctx->mastering_display) {
+        r = yah264_param_parse_mastering(p, ctx->mastering_display, why, sizeof(why));
+        if (r < 0) {
+            av_log(avctx, AV_LOG_ERROR, "mastering-display %s\n", why);
+            return AVERROR(EINVAL);
+        }
+        if (r > 0)
+            av_log(avctx, AV_LOG_WARNING, "mastering-display %s\n", why);
+    }
+    if (ctx->cll) {
+        r = yah264_param_parse_cll(p, ctx->cll, why, sizeof(why));
+        if (r < 0) {
+            av_log(avctx, AV_LOG_ERROR, "cll %s\n", why);
+            return AVERROR(EINVAL);
+        }
+        if (r > 0)
+            av_log(avctx, AV_LOG_WARNING, "cll %s\n", why);
+    }
+    return 0;
+}
+
+static int append_bytes(uint8_t **buf, size_t *size, const yah264_nal_t *n)
+{
+    uint8_t *p = av_realloc(*buf, *size + n->size);
+    if (!p)
+        return AVERROR(ENOMEM);
+    memcpy(p + *size, n->payload, n->size);
+    *buf = p;
+    *size += n->size;
+    return 0;
+}
+
 static av_cold int yah264_init(AVCodecContext *avctx)
 {
     Yah264Context *ctx = avctx->priv_data;
     yah264_param_t *p = &ctx->params;
     yah264_nal_t *nal;
-    int nnal, csp, i, size = 0;
-    uint8_t *dst;
+    int nnal, csp, i, ret;
 
     /* Both depths install under the same soname, so this mismatch links and
      * loads; it shows up as every plane being read at half or double its
@@ -219,11 +432,17 @@ static av_cold int yah264_init(AVCodecContext *avctx)
         p->sar_den = avctx->sample_aspect_ratio.den;
     }
 
+    yah264_hdr_side_data(avctx, ctx, p);
+    if ((ret = yah264_hdr_options(avctx, ctx, p)) < 0)
+        return ret;
+
     ctx->enc = yah264_encoder_open(p);
     if (!ctx->enc) {
         av_log(avctx, AV_LOG_ERROR, "yah264_encoder_open failed\n");
         return AVERROR_EXTERNAL;
     }
+    if ((ret = yah264_set_color(avctx, ctx->enc)) < 0)
+        return ret;
 
     /* dts trails pts by the stream's reorder depth and no more: the pyramid's
      * depth, 1 for flat B, 0 without B. The encoder's input latency does not
@@ -247,30 +466,33 @@ static av_cold int yah264_init(AVCodecContext *avctx)
 
     if (yah264_encoder_headers(ctx->enc, &nal, &nnal) < 0)
         return AVERROR_EXTERNAL;
-    for (i = 0; i < nnal; i++)
-        size += nal[i].size;
 
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
-        avctx->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
-        if (!avctx->extradata)
-            return AVERROR(ENOMEM);
-        dst = avctx->extradata;
-        for (i = 0; i < nnal; i++) {
-            memcpy(dst, nal[i].payload, nal[i].size);
-            dst += nal[i].size;
+    /* A global header holds the parameter sets only: an MP4 or Matroska
+     * muxer rebuilds it as a decoder configuration record, which has no
+     * place for SEI. The encoder already writes its display metadata in-band
+     * at every key; what SEI the headers still carry (the settings record, a
+     * buffering period) rides in-band ahead of the first slice. Without a
+     * global header everything goes in-band ahead of the first slice. */
+    for (i = 0; i < nnal; i++) {
+        int is_ps = nal[i].type == YAH264_NAL_SPS || nal[i].type == YAH264_NAL_PPS;
+
+        if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) && is_ps) {
+            uint8_t *x = av_realloc(avctx->extradata, avctx->extradata_size + nal[i].size +
+                                    AV_INPUT_BUFFER_PADDING_SIZE);
+            if (!x)
+                return AVERROR(ENOMEM);
+            memcpy(x + avctx->extradata_size, nal[i].payload, nal[i].size);
+            avctx->extradata = x;
+            avctx->extradata_size += nal[i].size;
+            memset(x + avctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+        } else if ((ret = append_bytes(&ctx->hdr, &ctx->hdr_size, &nal[i])) < 0) {
+            return ret;
         }
-        avctx->extradata_size = size;
-    } else {
-        ctx->hdr = av_malloc(size);
-        if (!ctx->hdr)
-            return AVERROR(ENOMEM);
-        dst = ctx->hdr;
-        for (i = 0; i < nnal; i++) {
-            memcpy(dst, nal[i].payload, nal[i].size);
-            dst += nal[i].size;
-        }
-        ctx->hdr_size = size;
+        if (is_ps && !(avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) &&
+            (ret = append_bytes(&ctx->rep_ps, &ctx->rep_ps_size, &nal[i])) < 0)
+            return ret;
     }
+    ctx->first_out = 1;
 
     ctx->pts_alloc = 64;
     ctx->pts_by_disp = av_malloc_array(ctx->pts_alloc, sizeof(*ctx->pts_by_disp));
@@ -370,7 +592,7 @@ static int burst_stash(Yah264Context *ctx, yah264_nal_t *nal, int nnal)
         /* [start .. i] is one coded frame: leading non-slice units plus the
          * slice itself. */
         {
-            size_t size = 0;
+            size_t size = 0, ps = 0;
             int j, key = 0;
             uint8_t *buf;
             for (j = start; j <= i; j++) {
@@ -378,12 +600,25 @@ static int burst_stash(Yah264Context *ctx, yah264_nal_t *nal, int nnal)
                 if (nal[j].type == YAH264_NAL_SLICE_IDR)
                     key = 1;
             }
-            buf = av_malloc(size);
+            /* the first IDR takes the headers from burst_pop instead */
+            if (key && !ctx->first_out)
+                ps = ctx->rep_ps_size;
+            if (key)
+                ctx->first_out = 0;
+            buf = av_malloc(size + ps);
             if (!buf)
                 return AVERROR(ENOMEM);
             {
                 uint8_t *d = buf;
+                int done = !ps;
                 for (j = start; j <= i; j++) {
+                    /* after a delimiter, ahead of any SEI: a buffering
+                     * period names the SPS it belongs to */
+                    if (!done && nal[j].type != 9 /* AUD */) {
+                        memcpy(d, ctx->rep_ps, ps);
+                        d += ps;
+                        done = 1;
+                    }
                     memcpy(d, nal[j].payload, nal[j].size);
                     d += nal[j].size;
                 }
@@ -396,7 +631,7 @@ static int burst_stash(Yah264Context *ctx, yah264_nal_t *nal, int nnal)
                 ctx->out_alloc = n;
             }
             ctx->out[ctx->out_count].data = buf;
-            ctx->out[ctx->out_count].size = size;
+            ctx->out[ctx->out_count].size = size + ps;
             ctx->out[ctx->out_count].key  = key;
             ctx->out_count++;
         }
@@ -452,6 +687,7 @@ static int submit_one(AVCodecContext *avctx, AVFrame *f)
     yah264_nal_t *nal;
     int nnal = 0, i, ret;
 
+    yah264_hdr_frame_check(avctx, ctx, f);
     memset(&pic, 0, sizeof(pic));
     pic.csp    = ctx->params.csp;
     pic.width  = avctx->width;
@@ -584,6 +820,10 @@ static const AVOption options[] = {
       AV_OPT_TYPE_FLOAT, { .dbl = -1 }, -1, 4, VE },
     { "psy-rd", "psychovisual RD strength (-1 = default)", OFFSET(psy_rd),
       AV_OPT_TYPE_FLOAT, { .dbl = -1 }, -1, 4, VE },
+    { "mastering-display", "mastering display SEI, G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min) "
+      "(over side data)", OFFSET(mastering_display), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
+    { "cll", "content light level SEI, MaxCLL,MaxFALL in cd/m^2 (over side data)",
+      OFFSET(cll), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
     { NULL }
 };
 
@@ -616,7 +856,7 @@ const FFCodec ff_libyah264_encoder = {
     FF_CODEC_RECEIVE_PACKET_CB(yah264_receive_packet),
     .close          = yah264_close,
     .defaults       = yah264_defaults,
-    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE |
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP |
                       FF_CODEC_CAP_AUTO_THREADS,
 #if Y264_BIT_DEPTH > 8
     CODEC_PIXFMTS(AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10,
