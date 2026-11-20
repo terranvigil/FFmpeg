@@ -1233,6 +1233,7 @@ OBJS-$(CONFIG_LIBXEVD_DECODER)            += libxevd.o
 OBJS-$(CONFIG_LIBXEVE_ENCODER)            += libxeve.o
 OBJS-$(CONFIG_LIBXVID_ENCODER)            += libxvid.o
 OBJS-$(CONFIG_LIBYAH264_ENCODER)          += libyah264.o
+OBJS-$(CONFIG_LIBYAH265_ENCODER)          += libyah265.o
 OBJS-$(CONFIG_LIBZVBI_TELETEXT_DECODER)   += libzvbi-teletextdec.o ass.o
 
 # parsers
