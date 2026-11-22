@@ -50,6 +50,9 @@ int n265_config_parse_list_10(n265_config *c, const char *list);
 int n265_config_apply_10(n265_config *c, n265_param *p);
 int n265_config_get_10(const n265_config *c, const char *key, double *v);
 const char *n265_config_get_str_10(const n265_config *c, const char *key);
+void n265_control_init_10(n265_control_t *ev, int kind);
+int n265_encoder_control_10(n265_encoder *e, n265_control_t *ev);
+const char *n265_control_strerror_10(int err);
 
 typedef struct Yah265Api {
     int depth;
@@ -68,6 +71,9 @@ typedef struct Yah265Api {
     int  (*config_apply)(n265_config *, n265_param *);
     int  (*config_get)(const n265_config *, const char *, double *);
     const char *(*config_get_str)(const n265_config *, const char *);
+    void (*control_init)(n265_control_t *, int);
+    int  (*encoder_control)(n265_encoder *, n265_control_t *);
+    const char *(*control_strerror)(int);
 } Yah265Api;
 
 static const Yah265Api api8 = {
@@ -76,7 +82,8 @@ static const Yah265Api api8 = {
     n265_encoder_access_units, n265_encoder_reorder_depth,
     n265_config_new, n265_config_free, n265_config_parse,
     n265_config_parse_list, n265_config_apply, n265_config_get,
-    n265_config_get_str,
+    n265_config_get_str, n265_control_init, n265_encoder_control,
+    n265_control_strerror,
 };
 
 static const Yah265Api api10 = {
@@ -85,7 +92,8 @@ static const Yah265Api api10 = {
     n265_encoder_access_units_10, n265_encoder_reorder_depth_10,
     n265_config_new_10, n265_config_free_10, n265_config_parse_10,
     n265_config_parse_list_10, n265_config_apply_10, n265_config_get_10,
-    n265_config_get_str_10,
+    n265_config_get_str_10, n265_control_init_10, n265_encoder_control_10,
+    n265_control_strerror_10,
 };
 
 typedef struct Yah265Out {
@@ -125,6 +133,10 @@ typedef struct Yah265Context {
     unsigned cll[2];
     int      md_user, cll_user;
     int      hdr_on, hdr_warned;
+
+    /* the rate fields as the last frame saw them, for live RATE events */
+    int64_t  ctl_bit_rate, ctl_max_rate;
+    int      ctl_buffer_size;
 
     Yah265Out *out;
     int        out_alloc, out_count;
@@ -477,6 +489,9 @@ static av_cold int yah265_init(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_ERROR, "n265_encoder_open failed\n");
         return AVERROR_EXTERNAL;
     }
+    ctx->ctl_bit_rate    = avctx->bit_rate;
+    ctx->ctl_max_rate    = avctx->rc_max_rate;
+    ctx->ctl_buffer_size = avctx->rc_buffer_size;
     ctx->reorder = ctx->api->reorder_depth(ctx->enc);
     if (ctx->reorder < 0)
         ctx->reorder = 0;
@@ -635,6 +650,45 @@ static int pop_packet(AVCodecContext *avctx, AVPacket *pkt)
     return 0;
 }
 
+static void control(AVCodecContext *avctx, n265_control_t *ev)
+{
+    Yah265Context *ctx = avctx->priv_data;
+    int r = ctx->api->encoder_control(ctx->enc, ev);
+
+    if (r < 0)
+        av_log(avctx, AV_LOG_WARNING, "live control refused: %s\n",
+               ctx->api->control_strerror(r));
+}
+
+/* The live-control mapping (the shared contract's section 11): an I
+ * frame asks for a keyframe, and a change of the rate fields between two
+ * frames is one RATE event on the next. Nothing else is mapped. */
+static void map_controls(AVCodecContext *avctx, const AVFrame *f)
+{
+    Yah265Context *ctx = avctx->priv_data;
+    n265_control_t ev;
+
+    if (f->pict_type == AV_PICTURE_TYPE_I) {
+        ctx->api->control_init(&ev, N265_CTL_KEYFRAME);
+        control(avctx, &ev);
+    }
+    if (avctx->bit_rate != ctx->ctl_bit_rate ||
+        avctx->rc_max_rate != ctx->ctl_max_rate ||
+        avctx->rc_buffer_size != ctx->ctl_buffer_size) {
+        ctx->api->control_init(&ev, N265_CTL_RATE);
+        if (avctx->bit_rate != ctx->ctl_bit_rate)
+            ev.bitrate_kbps = (int)((avctx->bit_rate + 500) / 1000);
+        if (avctx->rc_max_rate != ctx->ctl_max_rate)
+            ev.vbv_maxrate_kbps = (int)((avctx->rc_max_rate + 500) / 1000);
+        if (avctx->rc_buffer_size != ctx->ctl_buffer_size)
+            ev.vbv_bufsize_kbit = (avctx->rc_buffer_size + 500) / 1000;
+        control(avctx, &ev);
+        ctx->ctl_bit_rate    = avctx->bit_rate;
+        ctx->ctl_max_rate    = avctx->rc_max_rate;
+        ctx->ctl_buffer_size = avctx->rc_buffer_size;
+    }
+}
+
 static int submit(AVCodecContext *avctx, const AVFrame *f)
 {
     Yah265Context *ctx = avctx->priv_data;
@@ -651,6 +705,7 @@ static int submit(AVCodecContext *avctx, const AVFrame *f)
     yah265_hdr_frame_check(avctx, f);
     if ((ret = pts_push(ctx, f->pts)) < 0)
         return ret;
+    map_controls(avctx, f);
     if (ctx->api->encoder_encode(ctx->enc, &nal, &nnal, &pic) < 0)
         return AVERROR_EXTERNAL;
     return stash_output(avctx, nal, nnal);
