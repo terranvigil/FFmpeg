@@ -23,6 +23,7 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/frame.h"
+#include "libavutil/mastering_display_metadata.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -118,6 +119,13 @@ typedef struct Yah265Context {
     AVFrame *frame;
     int      eof;
 
+    /* HDR10 side data as init took it, in SEI units */
+    int      md_set, cll_set;
+    unsigned md_prim[6], md_wp[2], md_lum[2];
+    unsigned cll[2];
+    int      md_user, cll_user;
+    int      hdr_on, hdr_warned;
+
     Yah265Out *out;
     int        out_alloc, out_count;
     /* NALs with no picture (--eos / --eob at the end of a flush), which
@@ -194,6 +202,139 @@ static int set_h273(AVCodecContext *avctx, const char *name, int v, int unset)
     }
     snprintf(buf, sizeof(buf), "%d", v);
     return opt_set(avctx, name, buf);
+}
+
+static unsigned rescale_clip(AVRational q, int unit, int64_t max)
+{
+    int64_t v;
+
+    if (q.den <= 0 || q.num < 0)
+        return 0;
+    v = av_rescale(q.num, unit, q.den);
+    return v > max ? (unsigned)max : (unsigned)v;
+}
+
+/* The SEI needs the primaries and the luminance both, so side data with
+ * only one of them is skipped rather than written with zeroes. */
+static int mdcv_units(AVCodecContext *avctx, const AVMasteringDisplayMetadata *m,
+                      unsigned prim[6], unsigned wp[2], unsigned lum[2], int warn)
+{
+    /* the SEI lists green, blue, red; lavc stores red, green, blue */
+    static const int order[3] = { 1, 2, 0 };
+
+    if (!m->has_primaries || !m->has_luminance) {
+        if (warn && (m->has_primaries || m->has_luminance))
+            av_log(avctx, AV_LOG_WARNING, "mastering display side data has %s only; "
+                   "the SEI needs both, so none is written\n",
+                   m->has_primaries ? "primaries" : "luminance");
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        prim[2 * i]     = rescale_clip(m->display_primaries[order[i]][0], 50000, 50000);
+        prim[2 * i + 1] = rescale_clip(m->display_primaries[order[i]][1], 50000, 50000);
+    }
+    wp[0]  = rescale_clip(m->white_point[0], 50000, 50000);
+    wp[1]  = rescale_clip(m->white_point[1], 50000, 50000);
+    lum[0] = rescale_clip(m->max_luminance, 10000, UINT32_MAX);
+    lum[1] = rescale_clip(m->min_luminance, 10000, UINT32_MAX);
+    return 1;
+}
+
+/* whether the params list names key, so its value replaces the side data's */
+static int params_name(const char *params, const char *key)
+{
+    size_t n = strlen(key);
+    const char *q;
+
+    for (const char *p = params; p; p = (q = strchr(p, ':')) ? q + 1 : NULL) {
+        while (*p == '-')
+            p++;
+        if (!strncmp(p, key, n) && (p[n] == '=' || p[n] == ':' || !p[n]))
+            return 1;
+    }
+    return 0;
+}
+
+/* HDR10 metadata from the side data on the codec context, which ffmpeg's
+ * own tool copies there from the first decoded frame. Only a 10-bit PQ or
+ * HLG stream takes it; the library would write it on any stream. */
+static int yah265_hdr_side_data(AVCodecContext *avctx)
+{
+    Yah265Context *ctx = avctx->priv_data;
+    const AVFrameSideData *md, *cll;
+    char buf[160];
+    int pq_hlg = avctx->color_trc == AVCOL_TRC_SMPTE2084 ||
+                 avctx->color_trc == AVCOL_TRC_ARIB_STD_B67;
+    int ret;
+
+    md  = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+                                 AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    cll = av_frame_side_data_get(avctx->decoded_side_data, avctx->nb_decoded_side_data,
+                                 AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (!md && !cll)
+        return 0;
+    if (!pq_hlg || ctx->api->depth != 10) {
+        av_log(avctx, pq_hlg ? AV_LOG_WARNING : AV_LOG_VERBOSE,
+               "mastering display and light level side data not written: "
+               "the stream is not 10-bit PQ or HLG\n");
+        return 0;
+    }
+    ctx->hdr_on   = 1;
+    ctx->md_user  = params_name(ctx->params, "master-display");
+    ctx->cll_user = params_name(ctx->params, "max-cll");
+
+    if (cll && !ctx->cll_user) {
+        const AVContentLightMetadata *l = (const AVContentLightMetadata *)cll->data;
+        ctx->cll[0] = FFMIN(l->MaxCLL, 65535);
+        ctx->cll[1] = FFMIN(l->MaxFALL, 65535);
+        ctx->cll_set = 1;
+        snprintf(buf, sizeof(buf), "%u,%u", ctx->cll[0], ctx->cll[1]);
+        if ((ret = opt_set(avctx, "max-cll", buf)) < 0)
+            return ret;
+    }
+    if (md && !ctx->md_user &&
+        mdcv_units(avctx, (const AVMasteringDisplayMetadata *)md->data,
+                   ctx->md_prim, ctx->md_wp, ctx->md_lum, 1)) {
+        const unsigned *g = ctx->md_prim;
+        ctx->md_set = 1;
+        snprintf(buf, sizeof(buf), "G(%u,%u)B(%u,%u)R(%u,%u)WP(%u,%u)L(%u,%u)",
+                 g[0], g[1], g[2], g[3], g[4], g[5], ctx->md_wp[0], ctx->md_wp[1],
+                 ctx->md_lum[0], ctx->md_lum[1]);
+        if ((ret = opt_set(avctx, "master-display", buf)) < 0)
+            return ret;
+    }
+    return 0;
+}
+
+/* Once per encode: the first frame whose side data differs from what init
+ * took. Nothing can change these SEIs mid-stream, so it is only reported. */
+static void yah265_hdr_frame_check(AVCodecContext *avctx, const AVFrame *f)
+{
+    Yah265Context *ctx = avctx->priv_data;
+    const AVFrameSideData *sd;
+    unsigned prim[6], wp[2], lum[2];
+    int differs = 0;
+
+    if (!ctx->hdr_on || ctx->hdr_warned)
+        return;
+    sd = ctx->cll_user ? NULL : av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (sd) {
+        const AVContentLightMetadata *l = (const AVContentLightMetadata *)sd->data;
+        differs |= !ctx->cll_set || FFMIN(l->MaxCLL, 65535) != ctx->cll[0] ||
+                   FFMIN(l->MaxFALL, 65535) != ctx->cll[1];
+    }
+    sd = ctx->md_user ? NULL : av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd && mdcv_units(avctx, (const AVMasteringDisplayMetadata *)sd->data, prim, wp, lum, 0))
+        differs |= !ctx->md_set || memcmp(prim, ctx->md_prim, sizeof(prim)) ||
+                   memcmp(wp, ctx->md_wp, sizeof(wp)) ||
+                   memcmp(lum, ctx->md_lum, sizeof(lum));
+    if (differs) {
+        av_log(avctx, AV_LOG_WARNING, "the frame at pts %"PRId64" carries mastering display or light "
+               "level side data that differs from the stream's; the encoder writes what "
+               "it took at init (put it on the codec context, or use -yah265-params)\n",
+               f->pts);
+        ctx->hdr_warned = 1;
+    }
 }
 
 /* The options go through the library's own parser, in the order a command
@@ -277,6 +418,9 @@ static int yah265_configure(AVCodecContext *avctx, int csp)
             return ret;
     }
 
+    if ((ret = yah265_hdr_side_data(avctx)) < 0)
+        return ret;
+
     if (ctx->params && ctx->api->config_parse_list(ctx->cfg, ctx->params) != 0) {
         av_log(avctx, AV_LOG_ERROR, "yah265-params refused: %s\n", ctx->params);
         return AVERROR(EINVAL);
@@ -320,8 +464,7 @@ static av_cold int yah265_init(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_ERROR, "yah265 refused the configuration\n");
         return AVERROR(EINVAL);
     }
-    /* the metadata files are the command line's to read; through lavc the
-     * frames' side data would be the source, which is not wired yet */
+    /* the dynamic metadata files are the command line's to read */
     if (ctx->api->config_get_str(ctx->cfg, "dhdr10-info") ||
         ctx->api->config_get_str(ctx->cfg, "dolby-vision-rpu")) {
         av_log(avctx, AV_LOG_ERROR, "dhdr10-info and dolby-vision-rpu are "
@@ -505,6 +648,7 @@ static int submit(AVCodecContext *avctx, const AVFrame *f)
         pic.stride[i] = f->linesize[i] / bps;
     }
     pic.pts = f->pts;
+    yah265_hdr_frame_check(avctx, f);
     if ((ret = pts_push(ctx, f->pts)) < 0)
         return ret;
     if (ctx->api->encoder_encode(ctx->enc, &nal, &nnal, &pic) < 0)
