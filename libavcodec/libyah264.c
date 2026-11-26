@@ -405,8 +405,14 @@ static av_cold int yah264_init(AVCodecContext *avctx)
      * machinery whether the value was actually assigned. One consequence is
      * that an explicit -refs 1 reads as untouched and leaves the preset alone.
      */
-    if (av_opt_is_set_to_default_by_name(avctx, "refs", 0) == 0 && avctx->refs > 0)
+    if (av_opt_is_set_to_default_by_name(avctx, "refs", 0) == 0 && avctx->refs > 0) {
         p->ref = avctx->refs;
+#ifdef YAH264_SET_REF
+        /* the encoder lowers the preset's ref at large sizes, and without the
+         * bit it can't tell -refs 3 from the preset's 3 */
+        p->explicit_set |= YAH264_SET_REF;
+#endif
+    }
 
     /* Rate control. An explicit bitrate selects ABR; otherwise CRF, which is
      * what -crf sets and what the encoder defaults to. */
@@ -513,13 +519,21 @@ static av_cold int yah264_init(AVCodecContext *avctx)
     /* dts starts far enough back that the reordered pts never precedes it. */
     ctx->dts_next = -ctx->delay_frames;
 
-    av_log(avctx, AV_LOG_INFO,
-           "yah264 %s cpu=%s preset=%s threads=%d subme=%d bframes=%d ref=%d "
-           "rc=%d crf=%.1f keyint=%d\n",
-           yah264_version(), yah264_cpu_features(),
-           ctx->preset ? ctx->preset : "(none)",
-           p->threads, p->subme, p->bframes, p->ref,
-           p->rc.method, p->rc.rf, p->keyint);
+    {
+        /* log the ref the encode will use, not the one asked for, which the
+         * encoder may lower at large sizes */
+        yah264_param_t shown = *p;
+#ifdef YAH264_SET_REF
+        yah264_param_size_defaults(&shown);
+#endif
+        av_log(avctx, AV_LOG_INFO,
+               "yah264 %s cpu=%s preset=%s threads=%d subme=%d bframes=%d ref=%d "
+               "rc=%d crf=%.1f keyint=%d\n",
+               yah264_version(), yah264_cpu_features(),
+               ctx->preset ? ctx->preset : "(none)",
+               shown.threads, shown.subme, shown.bframes, shown.ref,
+               shown.rc.method, shown.rc.rf, shown.keyint);
+    }
     return 0;
 }
 
